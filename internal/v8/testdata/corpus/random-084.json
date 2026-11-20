@@ -1,0 +1,20 @@
+{
+ "$dict": [
+  [
+   "hello0",
+   {
+    "$undefined": true
+   }
+  ],
+  [
+   "hello1",
+   true
+  ],
+  [
+   "two\nlines2",
+   {
+    "$dict": []
+   }
+  ]
+ ]
+}

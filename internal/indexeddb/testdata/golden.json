@@ -1,0 +1,124 @@
+{
+ "databases": [
+  {
+   "number": 2,
+   "origin": "https_example.test_0@1",
+   "name": "beta"
+  },
+  {
+   "number": 1,
+   "origin": "https_example.test_0@1",
+   "name": "alpha"
+  }
+ ],
+ "records": [
+  {
+   "db": 2,
+   "store": "plain",
+   "key": "0104006f006e006c0079",
+   "live": true,
+   "value": {
+    "$int": "7"
+   }
+  },
+  {
+   "db": 1,
+   "store": "plain",
+   "key": "01010061",
+   "live": true,
+   "value": {
+    "$dict": [
+     [
+      "text",
+      "hello"
+     ],
+     [
+      "n",
+      {
+       "$int": "1"
+      }
+     ],
+     [
+      "big",
+      {
+       "$float": "4790066813869867008"
+      }
+     ]
+    ]
+   }
+  },
+  {
+   "db": 1,
+   "store": "plain",
+   "key": "01010062",
+   "live": true,
+   "value": {
+    "$list": [
+     "x",
+     null,
+     {
+      "$undefined": true
+     },
+     true
+    ]
+   }
+  },
+  {
+   "db": 1,
+   "store": "plain",
+   "key": "01010061",
+   "live": true,
+   "value": {
+    "$dict": [
+     [
+      "text",
+      "hello again"
+     ]
+    ]
+   }
+  },
+  {
+   "db": 1,
+   "store": "plain",
+   "key": "01040067006f006e0065",
+   "live": true,
+   "value": "soon deleted"
+  },
+  {
+   "db": 1,
+   "store": "plain",
+   "key": "01040067006f006e0065",
+   "live": false,
+   "value": null
+  },
+  {
+   "db": 1,
+   "store": "wrapped",
+   "key": "01010073",
+   "live": true,
+   "value": {
+    "$dict": [
+     [
+      "compressed",
+      "ünïcödé ✓ 😀"
+     ]
+    ]
+   }
+  },
+  {
+   "db": 1,
+   "store": "wrapped",
+   "key": "01010066",
+   "live": true,
+   "value": {
+    "$dict": [
+     [
+      "in",
+      "a blob file"
+     ]
+    ]
+   }
+  }
+ ],
+ "bad": 1
+}

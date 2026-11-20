@@ -1,0 +1,452 @@
+// Package teams reads the new Microsoft Teams (v2) message cache from the local
+// disk, read-only.
+//
+// The Teams client keeps recent conversations in a Chromium IndexedDB backed
+// by LevelDB. Each (tenant, user) context has its own databases, named
+// "Teams:<manager>:react-web-client:<tenantId>:<userObjectId>:<locale>":
+//   - messages: "Teams:replychain-manager:..." store "replychains", each record
+//     has a "messageMap" of message id to message,
+//   - chats and channels: "Teams:conversation-manager:..." store "conversations",
+//   - @-mentions: "Teams:messaging-slice-manager:..." store
+//     "mentions-metadata-items".
+package teams
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"iter"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+
+	"github.com/stn1slv/teamscache/internal/indexeddb"
+	"github.com/stn1slv/teamscache/internal/leveldb"
+	"github.com/stn1slv/teamscache/internal/v8"
+)
+
+// ErrCacheNotFound reports that no Teams cache folder was found.
+var ErrCacheNotFound = errors.New("teams cache not found")
+
+// Account is one (tenant, user) context in the cache.
+type Account struct {
+	TenantID string
+	UserID   string
+}
+
+// Key returns "<tenantId>:<userId>", the value of the account filters.
+func (a Account) Key() string { return a.TenantID + ":" + a.UserID }
+
+// Message is one cached message.
+type Message struct {
+	Account        string `json:"account"`
+	ConversationID string `json:"conversation_id"`
+	ReplyChainID   string `json:"reply_chain_id"`
+	MessageID      string `json:"message_id"`
+	Sender         string `json:"sender"`
+	Timestamp      string `json:"timestamp"`
+	Content        string `json:"content"`
+	ContentType    string `json:"content_type"`
+	// Seq is the LevelDB sequence number of the record version; a higher
+	// number is a newer version.
+	Seq uint64 `json:"-"`
+}
+
+// Conversation is a chat or channel.
+type Conversation struct {
+	Account         string `json:"account"`
+	ID              string `json:"id"`
+	Title           string `json:"title"`
+	Type            string `json:"type"`
+	LastMessageTime string `json:"last_message_time"`
+	LastMessage     string `json:"last_message"`
+}
+
+// Mention is an @-mention of the user. It has no content; join it with a
+// Message on (Account, MessageID).
+type Mention struct {
+	Account        string `json:"account"`
+	ConversationID string `json:"conversation_id"`
+	MessageID      string `json:"message_id"`
+	ReplyChainID   string `json:"reply_chain_id"`
+	Timestamp      string `json:"timestamp"`
+	IsRead         bool   `json:"is_read"`
+}
+
+// Reader reads a Teams cache.
+type Reader struct {
+	db      *indexeddb.DB
+	tmp     string
+	skipped int
+	logger  *slog.Logger
+}
+
+// Open reads the Teams LevelDB in path, or the auto-discovered one when path
+// is empty. The folder is first copied to a temporary folder, because the
+// running Teams client holds a lock on it. Call Close to remove the copy.
+// When ctx is canceled, Open removes the copy and returns the context's error.
+func Open(ctx context.Context, path string, logger *slog.Logger) (*Reader, error) {
+	if path == "" {
+		path = FindCache()
+	}
+	if info, err := os.Stat(path); path == "" || err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("%w: pass a LevelDB path, or sign in to the new Teams client once; looked in %v",
+			ErrCacheNotFound, DefaultCacheGlobs())
+	}
+	// Keep this prefix: local tooling may watch for it.
+	tmp, err := os.MkdirTemp("", "msteams-cache-")
+	if err != nil {
+		return nil, fmt.Errorf("create temporary folder: %w", err)
+	}
+	r := &Reader{tmp: tmp, logger: logger}
+	copyDir := filepath.Join(tmp, filepath.Base(path))
+	if err := copyDataFiles(ctx, path, copyDir, logger); err != nil {
+		r.Close()
+		return nil, err
+	}
+	r.db, err = indexeddb.Open(ctx, copyDir, blobDirFor(path), logger)
+	if err != nil {
+		r.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+// Close removes the temporary copy.
+func (r *Reader) Close() {
+	if r.tmp != "" {
+		if err := os.RemoveAll(r.tmp); err != nil {
+			r.logger.Warn("could not remove the temporary copy", "path", r.tmp, "error", err)
+		}
+		r.tmp = ""
+	}
+}
+
+// Skipped is the number of records that could not be decoded.
+func (r *Reader) Skipped() int { return r.skipped }
+
+// copyAttempts is how many times the copy is tried while Teams changes the
+// set of files, for example during a compaction.
+const copyAttempts = 3
+
+// copyDataFiles copies the LevelDB table and log files of src to dst. Other
+// files are not needed, and the LOCK file can be locked by the running client.
+// When the set of files changes during the copy, the copy starts again.
+func copyDataFiles(ctx context.Context, src, dst string, logger *slog.Logger) error {
+	for attempt := 1; ; attempt++ {
+		stable, err := copyOnce(ctx, src, dst)
+		if err != nil || stable {
+			return err
+		}
+		if attempt == copyAttempts {
+			logger.Warn("the cache changed during each copy; the result can miss recent data", "attempts", attempt)
+			return nil
+		}
+		if err := os.RemoveAll(dst); err != nil {
+			return fmt.Errorf("remove incomplete copy: %w", err)
+		}
+	}
+}
+
+// copyOnce copies the data files once. It reports whether the set of files
+// was the same before and after the copy and no file disappeared.
+func copyOnce(ctx context.Context, src, dst string) (stable bool, err error) {
+	before, err := dataFiles(src)
+	if err != nil {
+		return false, err
+	}
+	if err := os.Mkdir(dst, 0o700); err != nil {
+		return false, fmt.Errorf("create copy folder: %w", err)
+	}
+	stable = true
+	for _, name := range before {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		err := copyFile(filepath.Join(src, name), filepath.Join(dst, name))
+		if errors.Is(err, fs.ErrNotExist) {
+			stable = false
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	after, err := dataFiles(src)
+	if err != nil {
+		return false, err
+	}
+	return stable && slices.Equal(before, after), nil
+}
+
+// dataFiles returns the sorted names of the LevelDB data files in dir.
+func dataFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read cache folder: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && leveldb.IsDataFile(e.Name()) {
+			names = append(names, e.Name())
+		}
+	}
+	return names, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("copy cache file: %w", err)
+	}
+	defer func() { _ = in.Close() }() // read-only, a close error changes nothing
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("copy cache file: %w", err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close() // the copy error is the one to report
+		return fmt.Errorf("copy cache file: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("copy cache file: %w", err)
+	}
+	return nil
+}
+
+// storeRecord is one version of an object store record.
+type storeRecord struct {
+	key    string
+	seq    uint64
+	live   bool
+	value  any
+	failed bool // the value could not be decoded
+}
+
+// storeFunc yields, for each context of a manager in database order, the
+// account and every record version of one object store.
+type storeFunc func(manager, store string) iter.Seq2[Account, iter.Seq[storeRecord]]
+
+// current keeps the newest version of each record and drops records whose
+// newest version is a deletion or could not be decoded; an older version is
+// never shown in place of a newer one. Records keep the order of their first
+// version.
+func current(records iter.Seq[storeRecord]) []storeRecord {
+	var order []string
+	newest := map[string]storeRecord{}
+	for r := range records {
+		old, seen := newest[r.key]
+		if !seen {
+			order = append(order, r.key)
+		}
+		if !seen || r.seq >= old.seq {
+			newest[r.key] = r
+		}
+	}
+	out := make([]storeRecord, 0, len(order))
+	for _, k := range order {
+		if r := newest[k]; r.live && !r.failed && r.value != nil {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (r *Reader) stores(manager, store string) iter.Seq2[Account, iter.Seq[storeRecord]] {
+	return func(yield func(Account, iter.Seq[storeRecord]) bool) {
+		for _, d := range r.db.Databases() {
+			if !strings.Contains(d.Name, "Teams:"+manager+":") {
+				continue
+			}
+			// Teams:<manager>:react-web-client:<tenantId>:<userObjectId>:<locale>
+			parts := strings.Split(d.Name, ":")
+			if len(parts) < 6 {
+				r.logger.Debug("skipped a database with an unexpected name", "name", d.Name)
+				continue
+			}
+			acc := Account{TenantID: parts[len(parts)-3], UserID: parts[len(parts)-2]}
+			storeID, err := r.db.ObjectStoreID(d.Number, store)
+			if err != nil {
+				continue
+			}
+			values := func(yieldRecord func(storeRecord) bool) {
+				for rec := range r.db.Records(d.Number, storeID, r.onBad) {
+					if !yieldRecord(storeRecord{key: string(rec.Key), seq: rec.Seq, live: rec.Live, value: rec.Value, failed: rec.Err != nil}) {
+						return
+					}
+				}
+			}
+			if !yield(acc, values) {
+				return
+			}
+		}
+	}
+}
+
+func (r *Reader) onBad(err error) {
+	r.skipped++
+	r.logger.Debug("skipped a record", "error", err)
+}
+
+// Accounts returns the contexts that have a message store.
+func (r *Reader) Accounts() []Account {
+	return accounts(r.stores)
+}
+
+// Messages returns the messages of the newest version of each reply chain,
+// optionally only those of one account key.
+func (r *Reader) Messages(account string) []Message {
+	return messages(r.stores, account)
+}
+
+// Conversations returns chat and channel records, newest version only.
+func (r *Reader) Conversations(account string) []Conversation {
+	return conversations(r.stores, account)
+}
+
+// Mentions returns @-mention entries, newest version only, so the read state
+// is the current one. It is the only read state the cache keeps; general read
+// state is not stored locally.
+func (r *Reader) Mentions(account string) []Mention {
+	return mentions(r.stores, account)
+}
+
+func accounts(stores storeFunc) []Account {
+	var out []Account
+	for acc := range stores("replychain-manager", "replychains") {
+		out = append(out, acc)
+	}
+	return out
+}
+
+func messages(stores storeFunc, account string) []Message {
+	var out []Message
+	for acc, values := range stores("replychain-manager", "replychains") {
+		if account != "" && acc.Key() != account {
+			continue
+		}
+		for _, version := range current(values) {
+			rec, ok := version.value.(*v8.Object)
+			if !ok {
+				continue
+			}
+			mm, ok := or(get(rec, "messageMap"), nil).(*v8.Object)
+			if !ok {
+				continue
+			}
+			for i, mid := range mm.Keys() {
+				msg, ok := mm.Values()[i].(*v8.Object)
+				if !ok {
+					continue
+				}
+				content := text(get(msg, "content"))
+				if content == "" {
+					continue
+				}
+				out = append(out, Message{
+					Account:        acc.Key(),
+					ConversationID: valueString(getOr(rec, "conversationId", "")),
+					ReplyChainID:   valueString(getOr(rec, "replyChainId", "")),
+					MessageID:      valueString(getOr(msg, "id", mid)),
+					Sender:         text(or(get(msg, "imDisplayName"), get(msg, "from"))),
+					Timestamp:      valueString(or(or(get(msg, "originalArrivalTime"), get(msg, "composetime")), "")),
+					Content:        content,
+					ContentType:    valueString(or(get(msg, "messageType"), "")),
+					Seq:            version.seq,
+				})
+			}
+		}
+	}
+	return out
+}
+
+func conversations(stores storeFunc, account string) []Conversation {
+	var out []Conversation
+	for acc, values := range stores("conversation-manager", "conversations") {
+		if account != "" && acc.Key() != account {
+			continue
+		}
+		for _, rec := range current(values) {
+			v, ok := rec.value.(*v8.Object)
+			if !ok {
+				continue
+			}
+			last, _ := get(v, "lastMessage").(*v8.Object)
+			lastText := ""
+			if last != nil && last.Len() > 0 {
+				lastText = text(get(last, "content"))
+			}
+			out = append(out, Conversation{
+				Account:         acc.Key(),
+				ID:              valueString(getOr(v, "id", "")),
+				Title:           conversationTitle(v),
+				Type:            valueString(getOr(v, "type", "")),
+				LastMessageTime: valueString(getOr(v, "lastMessageTimeUtc", "")),
+				LastMessage:     lastText,
+			})
+		}
+	}
+	return out
+}
+
+// conversationTitle returns the display title of a conversation record, or
+// "". Channels and named group chats have threadProperties.topic. Other chats
+// use chatTitle, the title the Teams client computed; a short title with an
+// unknown member gives way to the long title.
+func conversationTitle(record *v8.Object) string {
+	if topic := text(or(get(get(record, "threadProperties"), "topic"), "")); topic != "" {
+		return topic
+	}
+	chat, ok := get(record, "chatTitle").(*v8.Object)
+	if !ok {
+		return ""
+	}
+	short := ""
+	if !truthy(get(chat, "hasUnknownUserInShortTitle")) {
+		short = text(or(get(chat, "shortTitle"), ""))
+	}
+	if short != "" {
+		return short
+	}
+	return text(or(get(chat, "longTitle"), ""))
+}
+
+func mentions(stores storeFunc, account string) []Mention {
+	var out []Mention
+	for acc, values := range stores("messaging-slice-manager", "mentions-metadata-items") {
+		if account != "" && acc.Key() != account {
+			continue
+		}
+		for _, rec := range current(values) {
+			v, ok := rec.value.(*v8.Object)
+			if !ok {
+				continue
+			}
+			out = append(out, Mention{
+				Account:        acc.Key(),
+				ConversationID: valueString(getOr(v, "sourceThreadId", "")),
+				MessageID:      valueString(getOr(v, "sourceMessageId", "")),
+				ReplyChainID:   valueString(getOr(v, "sourceReplyChainId", "")),
+				Timestamp:      valueString(getOr(v, "timestamp", "")),
+				IsRead:         valueString(get(v, "isRead")) == "True",
+			})
+		}
+	}
+	return out
+}
+
+var orgRE = regexp.MustCompile(`\(([^)]+)\)\s*$`)
+
+// OrgLabel returns the organization in a display name like "Ann Lee (Org)".
+func OrgLabel(sender string) (string, bool) {
+	m := orgRE.FindStringSubmatch(sender)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}

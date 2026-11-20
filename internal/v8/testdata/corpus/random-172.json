@@ -1,0 +1,17 @@
+{
+ "$dict": [
+  [
+   "<p>Hi&amp;bye</p>0",
+   {
+    "$dict": [
+     [
+      "messageMap",
+      {
+       "$dict": []
+      }
+     ]
+    ]
+   }
+  ]
+ ]
+}

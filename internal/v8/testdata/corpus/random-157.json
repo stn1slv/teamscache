@@ -1,0 +1,14 @@
+{
+ "$list": [
+  {
+   "$dict": [
+    [
+     "emoji 😀👍0",
+     {
+      "$undefined": true
+     }
+    ]
+   ]
+  }
+ ]
+}

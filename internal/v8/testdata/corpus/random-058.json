@@ -1,0 +1,201 @@
+{
+ "$dict": [
+  [
+   {
+    "$int": "0"
+   },
+   {
+    "$dict": [
+     [
+      "messageMap",
+      {
+       "$dict": [
+        [
+         {
+          "$int": "176855700"
+         },
+         {
+          "$dict": [
+           [
+            "k0",
+            {
+             "$dict": [
+              [
+               "k0",
+               {
+                "$dict": [
+                 [
+                  "messageMap",
+                  {
+                   "$dict": [
+                    [
+                     {
+                      "$int": "176855700"
+                     },
+                     null
+                    ],
+                    [
+                     {
+                      "$int": "176855701"
+                     },
+                     {
+                      "$float": "4790066817635344384"
+                     }
+                    ],
+                    [
+                     {
+                      "$int": "176855702"
+                     },
+                     {
+                      "$int": "870"
+                     }
+                    ],
+                    [
+                     {
+                      "$int": "176855703"
+                     },
+                     {
+                      "$date_us": "1705648413519000"
+                     }
+                    ]
+                   ]
+                  }
+                 ]
+                ]
+               }
+              ],
+              [
+               "k1",
+               {
+                "$list": []
+               }
+              ],
+              [
+               "k2",
+               {
+                "$dict": [
+                 [
+                  {
+                   "$int": "0"
+                  },
+                  "emoji 😀👍"
+                 ]
+                ]
+               }
+              ]
+             ]
+            }
+           ],
+           [
+            "k1",
+            {
+             "$float": "13902736785905350656"
+            }
+           ]
+          ]
+         }
+        ]
+       ]
+      }
+     ]
+    ]
+   }
+  ],
+  [
+   "k1",
+   {
+    "$dict": [
+     [
+      "messageMap",
+      {
+       "$dict": [
+        [
+         {
+          "$int": "176855700"
+         },
+         {
+          "$float": "4790066817242615808"
+         }
+        ]
+       ]
+      }
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$int": "2"
+   },
+   {
+    "$list": [
+     {
+      "$dict": []
+     },
+     {
+      "$list": []
+     },
+     {
+      "$list": [
+       {
+        "$dict": [
+         [
+          "messageMap",
+          {
+           "$dict": [
+            [
+             {
+              "$int": "176855700"
+             },
+             {
+              "$undefined": true
+             }
+            ],
+            [
+             {
+              "$int": "176855701"
+             },
+             {
+              "$dict": [
+               [
+                {
+                 "$int": "0"
+                },
+                false
+               ],
+               [
+                {
+                 "$int": "1"
+                },
+                true
+               ]
+              ]
+             }
+            ],
+            [
+             {
+              "$int": "176855702"
+             },
+             {
+              "$float": "4686590142389945344"
+             }
+            ]
+           ]
+          }
+         ]
+        ]
+       },
+       "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   "k3",
+   {
+    "$list": []
+   }
+  ]
+ ]
+}

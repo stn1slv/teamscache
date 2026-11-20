@@ -1,0 +1,343 @@
+{
+ "$list": [
+  {
+   "$list": [
+    {
+     "$dict": [
+      [
+       "日本語0",
+       {
+        "$dict": [
+         [
+          "k0",
+          {
+           "$dict": [
+            [
+             {
+              "$int": "0"
+             },
+             "hello"
+            ],
+            [
+             {
+              "$int": "1"
+             },
+             true
+            ],
+            [
+             {
+              "$int": "2"
+             },
+             ""
+            ]
+           ]
+          }
+         ],
+         [
+          "k1",
+          {
+           "$float": "13914998603876091648"
+          }
+         ],
+         [
+          "k2",
+          {
+           "$dict": [
+            [
+             "messageMap",
+             {
+              "$dict": [
+               [
+                {
+                 "$int": "176855700"
+                },
+                "<p>Hi&amp;bye</p>"
+               ],
+               [
+                {
+                 "$int": "176855701"
+                },
+                {
+                 "$float": "4675280331727204352"
+                }
+               ],
+               [
+                {
+                 "$int": "176855702"
+                },
+                {
+                 "$undefined": true
+                }
+               ],
+               [
+                {
+                 "$int": "176855703"
+                },
+                {
+                 "$float": "4790066815388815360"
+                }
+               ]
+              ]
+             }
+            ]
+           ]
+          }
+         ],
+         [
+          {
+           "$int": "3"
+          },
+          true
+         ]
+        ]
+       }
+      ],
+      [
+       "two\nlines1",
+       {
+        "$dict": [
+         [
+          "emoji 😀👍0",
+          {
+           "$dict": [
+            [
+             {
+              "$int": "0"
+             },
+             false
+            ]
+           ]
+          }
+         ],
+         [
+          "hello1",
+          {
+           "$date_us": "1705745014171000"
+          }
+         ],
+         [
+          "emoji 😀👍2",
+          {
+           "$dict": [
+            [
+             {
+              "$int": "1"
+             },
+             {
+              "$float": "4790066814184558592"
+             }
+            ],
+            [
+             "ünïcödé ✓0",
+             {
+              "$date_us": "1700451706398000"
+             }
+            ],
+            [
+             "ünïcödé ✓2",
+             {
+              "$float": "4746794007678418944"
+             }
+            ]
+           ]
+          }
+         ],
+         [
+          "日本語3",
+          {
+           "$dict": [
+            [
+             {
+              "$int": "0"
+             },
+             true
+            ]
+           ]
+          }
+         ]
+        ]
+       }
+      ]
+     ]
+    },
+    {
+     "$dict": [
+      [
+       {
+        "$int": "1"
+       },
+       {
+        "$list": [
+         {
+          "$dict": []
+         },
+         {
+          "$dict": [
+           [
+            "emoji 😀👍0",
+            {
+             "$float": "4690697233745315840"
+            }
+           ],
+           [
+            "Teams1",
+            {
+             "$int": "789"
+            }
+           ],
+           [
+            "ünïcödé ✓2",
+            true
+           ]
+          ]
+         },
+         {
+          "$int": "335"
+         },
+         {
+          "$list": [
+           {
+            "$undefined": true
+           },
+           {
+            "$float": "4746794007529521152"
+           },
+           {
+            "$float": "13912216604624091648"
+           }
+          ]
+         }
+        ]
+       }
+      ],
+      [
+       "a0",
+       "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ],
+      [
+       "hello2",
+       {
+        "$dict": [
+         [
+          {
+           "$int": "0"
+          },
+          {
+           "$list": [
+            false
+           ]
+          }
+         ]
+        ]
+       }
+      ]
+     ]
+    },
+    {
+     "$list": [
+      {
+       "$dict": [
+        [
+         "messageMap",
+         {
+          "$dict": [
+           [
+            {
+             "$int": "176855700"
+            },
+            {
+             "$dict": [
+              [
+               "日本語0",
+               {
+                "$float": "4746794007678418944"
+               }
+              ]
+             ]
+            }
+           ],
+           [
+            {
+             "$int": "176855701"
+            },
+            {
+             "$dict": [
+              [
+               "emoji 😀👍0",
+               true
+              ],
+              [
+               "hello1",
+               "Teams"
+              ]
+             ]
+            }
+           ]
+          ]
+         }
+        ]
+       ]
+      },
+      {
+       "$list": [
+        {
+         "$dict": [
+          [
+           "Teams0",
+           {
+            "$float": "4790066814821552128"
+           }
+          ],
+          [
+           "emoji 😀👍1",
+           {
+            "$date_us": "1708606021697000"
+           }
+          ]
+         ]
+        },
+        {
+         "$dict": [
+          [
+           "k0",
+           {
+            "$undefined": true
+           }
+          ]
+         ]
+        }
+       ]
+      },
+      {
+       "$list": [
+        {
+         "$dict": [
+          [
+           "messageMap",
+           {
+            "$dict": []
+           }
+          ]
+         ]
+        },
+        {
+         "$dict": [
+          [
+           "messageMap",
+           {
+            "$dict": []
+           }
+          ]
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "$dict": []
+  }
+ ]
+}

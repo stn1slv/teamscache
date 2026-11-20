@@ -32,3 +32,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Build output
+/bin/
+
+# GoReleaser output
+/dist/

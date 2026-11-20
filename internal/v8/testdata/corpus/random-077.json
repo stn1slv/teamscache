@@ -1,0 +1,254 @@
+{
+ "$list": [
+  {
+   "$list": [
+    false
+   ]
+  },
+  false,
+  {
+   "$list": [
+    {
+     "$date_us": "1706618472733000"
+    },
+    {
+     "$dict": [
+      [
+       {
+        "$int": "0"
+       },
+       {
+        "$list": [
+         {
+          "$dict": [
+           [
+            {
+             "$int": "0"
+            },
+            {
+             "$float": "4790066815832879104"
+            }
+           ],
+           [
+            "k1",
+            {
+             "$int": "297"
+            }
+           ],
+           [
+            {
+             "$int": "2"
+            },
+            {
+             "$float": "4746794007995088896"
+            }
+           ],
+           [
+            "k3",
+            {
+             "$undefined": true
+            }
+           ]
+          ]
+         },
+         {
+          "$dict": [
+           [
+            "messageMap",
+            {
+             "$dict": [
+              [
+               {
+                "$int": "176855700"
+               },
+               {
+                "$float": "4689656476725315840"
+               }
+              ],
+              [
+               {
+                "$int": "176855701"
+               },
+               ""
+              ],
+              [
+               {
+                "$int": "176855702"
+               },
+               {
+                "$int": "625"
+               }
+              ]
+             ]
+            }
+           ]
+          ]
+         },
+         {
+          "$dict": [
+           [
+            "a0",
+            "hello"
+           ]
+          ]
+         }
+        ]
+       }
+      ],
+      [
+       {
+        "$int": "1"
+       },
+       {
+        "$list": []
+       }
+      ],
+      [
+       {
+        "$int": "2"
+       },
+       {
+        "$float": "4790066815690579968"
+       }
+      ],
+      [
+       "k3",
+       {
+        "$date_us": "1702549081123000"
+       }
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "$list": [
+    {
+     "$dict": [
+      [
+       "messageMap",
+       {
+        "$dict": []
+       }
+      ]
+     ]
+    },
+    {
+     "$dict": [
+      [
+       "messageMap",
+       {
+        "$dict": []
+       }
+      ]
+     ]
+    },
+    {
+     "$dict": [
+      [
+       {
+        "$int": "3"
+       },
+       "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ],
+      [
+       "ünïcödé ✓0",
+       {
+        "$dict": []
+       }
+      ],
+      [
+       "<p>Hi&amp;bye</p>1",
+       {
+        "$dict": [
+         [
+          {
+           "$int": "0"
+          },
+          {
+           "$dict": [
+            [
+             "Teams0",
+             null
+            ],
+            [
+             "Teams1",
+             {
+              "$float": "4746794007254794240"
+             }
+            ],
+            [
+             "Teams2",
+             false
+            ]
+           ]
+          }
+         ]
+        ]
+       }
+      ],
+      [
+       "ünïcödé ✓2",
+       {
+        "$list": [
+         {
+          "$dict": [
+           [
+            "<p>Hi&amp;bye</p>0",
+            {
+             "$float": "4746794008185929728"
+            }
+           ],
+           [
+            "two\nlines1",
+            null
+           ],
+           [
+            "Teams2",
+            {
+             "$float": "4689384687289315840"
+            }
+           ]
+          ]
+         },
+         {
+          "$dict": [
+           [
+            {
+             "$int": "0"
+            },
+            {
+             "$int": "784"
+            }
+           ],
+           [
+            {
+             "$int": "1"
+            },
+            null
+           ]
+          ]
+         },
+         {
+          "$dict": [
+           [
+            "two\nlines0",
+            {
+             "$int": "853"
+            }
+           ],
+           [
+            "hello1",
+            true
+           ]
+          ]
+         }
+        ]
+       }
+      ]
+     ]
+    }
+   ]
+  }
+ ]
+}

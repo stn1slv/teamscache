@@ -1,0 +1,57 @@
+version: "2"
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gocritic
+    - gosec
+    - bodyclose
+    - noctx
+    - errorlint
+    - prealloc
+    - unparam
+    - nilerr
+    - forcetypeassert
+    - makezero
+    - exhaustive
+    - goconst
+    - misspell
+    - testifylint
+  settings:
+    revive:
+      rules:
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: if-return
+        - name: var-naming
+        - name: package-comments
+    exhaustive:
+      default-signifies-exhaustive: true
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    testifylint:
+      enable-all: true
+    gosec:
+      excludes:
+        # The binary parsers check bounds before they convert lengths and offsets.
+        - G115
+        # Reading files from paths the user gives is what this tool does.
+        - G304
+  exclusions:
+    rules:
+      # Repeated literals in test tables are clearer than constants.
+      - path: _test\.go
+        linters:
+          - goconst
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

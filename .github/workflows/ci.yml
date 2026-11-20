@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and vet (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # golangci-lint is pinned as a tool in go.mod, so it is built with the
+      # same Go version as the project.
+      - name: golangci-lint
+        run: go tool golangci-lint run --timeout=5m ./...
+
+      - name: gofumpt
+        run: test -z "$(go tool gofumpt -extra -l .)" || (go tool gofumpt -extra -l . && exit 1)
+
+      # Cache discovery differs per OS (runtime.GOOS), so vet and lint the
+      # Windows and macOS builds too. The code is pure Go and cross-checks from Linux.
+      - name: go vet (windows)
+        run: go vet ./...
+        env:
+          GOOS: windows
+
+      # Build the linter for the runner first; with GOOS set, "go tool" would
+      # build a Windows binary that cannot run here.
+      - name: golangci-lint (windows)
+        run: |
+          go build -o "$RUNNER_TEMP/golangci-lint" github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+          GOOS=windows "$RUNNER_TEMP/golangci-lint" run --timeout=5m ./...
+
+      - name: go vet (darwin)
+        run: go vet ./...
+        env:
+          GOOS: darwin
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  test-ubuntu:
+    name: Tests (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-ubuntu
+          path: coverage.out
+
+  test-windows:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
+
+  test-darwin:
+    name: Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go build
+        run: make build
+
+      - name: go test
+        run: make test

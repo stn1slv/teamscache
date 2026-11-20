@@ -1,0 +1,68 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: teamscache
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - windows
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    main: ./cmd/teamscache
+    binary: teamscache
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+
+archives:
+  - id: default
+    ids:
+      - teamscache
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - THIRD_PARTY_NOTICES.md
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+brews:
+  - name: teamscache
+    repository:
+      owner: stn1slv
+      name: homebrew-tap
+      # A custom token is needed to push to a different repository
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    # Skip the tap until the TAP_GITHUB_TOKEN secret is set, so a release
+    # without it still succeeds.
+    skip_upload: '{{ if eq (index .Env "TAP_GITHUB_TOKEN") "" }}true{{ else }}false{{ end }}'
+    homepage: "https://github.com/stn1slv/teamscache"
+    description: "Read the local Microsoft Teams message cache from the command line or over MCP"
+    license: "MIT"
+    test: |
+      system "#{bin}/teamscache", "--version"

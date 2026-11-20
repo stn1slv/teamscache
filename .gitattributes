@@ -1,0 +1,2 @@
+# Test fixtures are byte-exact, so line endings must never be converted.
+**/testdata/** -text

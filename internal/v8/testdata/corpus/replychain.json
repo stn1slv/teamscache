@@ -1,0 +1,48 @@
+{
+ "$dict": [
+  [
+   "conversationId",
+   "19:abc@thread.v2"
+  ],
+  [
+   "replyChainId",
+   "1768557031836"
+  ],
+  [
+   "messageMap",
+   {
+    "$dict": [
+     [
+      "1768557031836",
+      {
+       "$dict": [
+        [
+         "id",
+         "1768557031836"
+        ],
+        [
+         "content",
+         "<div>Hello &amp; welcome</div>"
+        ],
+        [
+         "imDisplayName",
+         "Ann Lee (Org)"
+        ],
+        [
+         "originalArrivalTime",
+         {
+          "$float": "4790066813869867008"
+         }
+        ],
+        [
+         "messageType",
+         "RichText/Html"
+        ]
+       ]
+      }
+     ]
+    ]
+   }
+  ]
+ ]
+}
