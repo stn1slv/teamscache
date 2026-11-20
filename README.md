@@ -10,13 +10,23 @@ To read Teams messages through Microsoft Graph, you need permissions such as `Ch
 
 ## Install
 
+With Homebrew on macOS or Linux:
+
+```bash
+brew install stn1slv/tap/teamscache
+```
+
+Binaries for macOS, Linux and Windows are on the [releases page](https://github.com/stn1slv/teamscache/releases).
+
+With Go 1.27 or later:
+
 ```bash
 go install github.com/stn1slv/teamscache/cmd/teamscache@latest
 ```
 
 Or build from source with `make build`; the binary is written to `bin/teamscache`.
 
-You need Go 1.27 or later, and a new Teams client that has been signed in at least once. Auto-discovery of the cache works on macOS and Windows. On Linux it is best effort.
+You need a new Teams client that has been signed in at least once. Auto-discovery of the cache works on macOS and Windows. On Linux it is best effort.
 
 ## Usage
 
