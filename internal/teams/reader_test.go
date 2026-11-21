@@ -419,6 +419,169 @@ func TestDatabasesWithUnexpectedNamesAreSkipped(t *testing.T) {
 	assert.Empty(t, r.Messages(""))
 }
 
+func TestNumberedStoresAreRead(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	chain := func(conv string, ids ...string) idbtest.Obj {
+		mm := make(idbtest.Obj, 0, len(ids))
+		for _, id := range ids {
+			mm = append(mm, p(id, idbtest.Obj{p("id", id), p("content", "text of "+id)}))
+		}
+		return idbtest.Obj{p("conversationId", conv), p("messageMap", mm)}
+	}
+	require.NoError(t, idbtest.Write(dir, "", []idbtest.Database{{
+		Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+		Stores: []idbtest.Store{
+			{Name: "replychains-2", Records: []idbtest.Record{
+				{Key: "r2", Value: chain("c2", "m3")}, // the store with the newer id is written first
+			}},
+			{Name: "replychains", Records: []idbtest.Record{
+				{Key: "r1", Value: chain("c1", "m1")},
+				{Key: "r2", Value: chain("c2", "m3"), Deleted: true}, // deleted here, kept in replychains-2
+			}},
+			{Name: "replychains-3", Records: []idbtest.Record{
+				{Key: "r1", Value: chain("c1", "m1", "m2")}, // a newer version of r1
+			}},
+			{Name: "replychains-old", Records: []idbtest.Record{{Key: "r9", Value: chain("c9", "m9")}}},
+			{Name: "other-replychains-2", Records: []idbtest.Record{{Key: "r8", Value: chain("c8", "m8")}}},
+		},
+	}}))
+
+	r, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+
+	msgs := r.Messages("")
+	got := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		got = append(got, m.ConversationID+"/"+m.MessageID)
+	}
+	assert.ElementsMatch(t, []string{"c1/m1", "c1/m2", "c2/m3"}, got,
+		"the newest version of r1 once, r2 from the store that keeps it, no other store")
+	assert.Equal(t, []Account{{TenantID: "t", UserID: "u"}}, r.Accounts())
+}
+
+// crossStoreCache writes a Teams cache in two steps, so the base stores
+// (lower ids) hold newer versions than their numbered copies. Each argument
+// maps a base store name to its records in that step.
+func crossStoreCache(t *testing.T, older, newer map[string][]idbtest.Record) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	type pair struct {
+		number         uint64
+		manager, store string
+	}
+	pairs := []pair{
+		{1, "replychain-manager", "replychains"},
+		{2, "messaging-slice-manager", "mentions-metadata-items"},
+		{3, "conversation-manager", "conversations"},
+	}
+	for _, step := range []struct {
+		base, copied map[string][]idbtest.Record
+	}{{copied: older}, {base: newer}} {
+		dbs := make([]idbtest.Database, 0, len(pairs))
+		for _, pr := range pairs {
+			dbs = append(dbs, idbtest.Database{
+				Number: pr.number, Name: "Teams:" + pr.manager + ":react-web-client:t:u:en-us",
+				Stores: []idbtest.Store{{Name: pr.store, Records: step.base[pr.store]}, {Name: pr.store + "-2", Records: step.copied[pr.store]}},
+			})
+		}
+		require.NoError(t, idbtest.Write(dir, "", dbs))
+	}
+	return dir
+}
+
+func TestNewestVersionWinsAcrossStores(t *testing.T) {
+	t.Parallel()
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	msg := func(id, text string) idbtest.Prop { return p(id, idbtest.Obj{p("id", id), p("content", text)}) }
+	chain := func(msgs ...idbtest.Prop) idbtest.Obj {
+		return idbtest.Obj{p("conversationId", "c1"), p("messageMap", idbtest.Obj(msgs))}
+	}
+	mention := func(read bool) idbtest.Obj {
+		return idbtest.Obj{p("sourceThreadId", "c1"), p("sourceMessageId", "m1"), p("isRead", read)}
+	}
+	chat := func(topic string) idbtest.Obj {
+		return idbtest.Obj{p("id", "c1"), p("threadProperties", idbtest.Obj{p("topic", topic)})}
+	}
+	dir := crossStoreCache(t, map[string][]idbtest.Record{
+		"replychains":             {{Key: "r1", Value: chain(msg("m1", "old"), msg("m2", "only in the copy"), msg("m4", "text before it was cleared"))}},
+		"mentions-metadata-items": {{Key: "x", Value: mention(false)}},
+		"conversations":           {{Key: "c1", Value: chat("Old topic")}},
+	}, map[string][]idbtest.Record{
+		"replychains":             {{Key: "r1", Value: chain(msg("m1", "edited"), msg("m3", "only in the base"), msg("m4", ""))}},
+		"mentions-metadata-items": {{Key: "x", Value: mention(true)}},
+		"conversations":           {{Key: "c1", Value: chat("New topic")}},
+	})
+
+	r, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+
+	got := map[string]string{}
+	for _, m := range r.Messages("") {
+		_, dup := got[m.MessageID]
+		assert.False(t, dup, "message %s is returned once", m.MessageID)
+		got[m.MessageID] = m.Content
+	}
+	assert.Equal(t, map[string]string{"m1": "edited", "m2": "only in the copy", "m3": "only in the base"}, got,
+		"the messages of both copies of the chain, each from its newest version; m4 was cleared in the newer version")
+	mentions := r.Mentions("")
+	require.Len(t, mentions, 1)
+	assert.True(t, mentions[0].IsRead, "the newer version in the store with the lower id wins")
+	conversations := r.Conversations("")
+	require.Len(t, conversations, 1)
+	assert.Equal(t, "New topic", conversations[0].Title)
+}
+
+func TestUndecodableVersionHidesOlderCopies(t *testing.T) {
+	t.Parallel()
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	dir := crossStoreCache(t, map[string][]idbtest.Record{
+		"replychains": {{Key: "r1", Value: idbtest.Obj{p("conversationId", "c1"), p("messageMap", idbtest.Obj{
+			p("m1", idbtest.Obj{p("id", "m1"), p("content", "old")}),
+		})}}},
+		"mentions-metadata-items": {{Key: "x", Value: idbtest.Obj{p("sourceThreadId", "c1"), p("sourceMessageId", "m1"), p("isRead", false)}}},
+		"conversations":           {{Key: "c1", Value: idbtest.Obj{p("id", "c1")}}},
+	}, map[string][]idbtest.Record{
+		"replychains":             {{Key: "r1", Value: "x", Wrapping: idbtest.Corrupt}},
+		"mentions-metadata-items": {{Key: "x", Value: "x", Wrapping: idbtest.Corrupt}},
+		"conversations":           {{Key: "c1", Value: "x", Wrapping: idbtest.Corrupt}},
+	})
+
+	r, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+
+	assert.Empty(t, r.Messages(""), "an older chain copy is not shown in place of a newer one")
+	assert.Empty(t, r.Mentions(""), "an older unread state is not shown in place of a newer one")
+	assert.Empty(t, r.Conversations(""))
+	assert.Equal(t, 3, r.Skipped())
+}
+
+func TestMessagesWithoutIDAreKept(t *testing.T) {
+	t.Parallel()
+	got := messages(fakeStores(obj("conversationId", "c", "messageMap", obj(
+		"a", obj("id", "", "content", "first"),
+		"b", obj("id", "", "content", "second"),
+	))), "")
+
+	require.Len(t, got, 2, "messages with an empty id do not replace each other")
+	assert.Equal(t, []string{"first", "second"}, []string{got[0].Content, got[1].Content})
+}
+
+func TestIsStore(t *testing.T) {
+	t.Parallel()
+	for name, want := range map[string]bool{
+		"replychains": true, "replychains-2": true, "replychains-10": true,
+		"replychains-": false, "replychains-x": false, "replychains-2-3": false, "my-replychains-2": false, "replychain": false,
+	} {
+		assert.Equal(t, want, isStore(name, "replychains"), name)
+	}
+	assert.True(t, isStore("mentions-metadata-items-2", "mentions-metadata-items"))
+}
+
 func TestOpenStopsWhenCanceled(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "sample.leveldb")
