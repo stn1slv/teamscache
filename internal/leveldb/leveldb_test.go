@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -372,16 +374,20 @@ func TestTableRecoveryKeepsBlocksAfterChecksumDamage(t *testing.T) {
 
 func TestReadDirReturnsRootFileErrorInsteadOfCanceled(t *testing.T) {
 	t.Parallel()
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores file permissions")
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("needs at least 2 workers")
 	}
-	dir := t.TempDir()
-	writeFixture(t, dir)
-	bad := filepath.Join(dir, "999999.ldb")
-	require.NoError(t, os.WriteFile(bad, []byte("x"), 0o000))
+	rootErr := errors.New("disk read failed")
+	files := []dataFile{{path: "000001.ldb", number: 1}, {path: "000002.ldb", number: 2}}
 
-	_, _, err := ReadDir(context.Background(), dir, slog.New(slog.DiscardHandler))
+	_, err := parseFiles(context.Background(), files, func(ctx context.Context, f dataFile) fileResult {
+		if f.number == 1 {
+			<-ctx.Done()
+			return fileResult{err: ctx.Err()}
+		}
+		return fileResult{err: rootErr}
+	})
 
-	require.Error(t, err)
+	require.ErrorIs(t, err, rootErr)
 	assert.NotErrorIs(t, err, context.Canceled)
 }

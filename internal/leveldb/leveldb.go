@@ -177,6 +177,51 @@ func parseDataFile(ctx context.Context, f dataFile) fileResult {
 	return res
 }
 
+func parseFiles(ctx context.Context, files []dataFile, parse func(context.Context, dataFile) fileResult) ([]fileResult, error) {
+	results := make([]fileResult, len(files))
+	if len(files) == 0 {
+		return results, nil
+	}
+	workers := min(runtime.GOMAXPROCS(0), len(files))
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var next atomic.Int64
+	var errOnce sync.Once
+	var firstErr error
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(files) {
+					return
+				}
+				if err := workCtx.Err(); err != nil {
+					results[i] = fileResult{err: err}
+					return
+				}
+				res := parse(workCtx, files[i])
+				results[i] = res
+				if res.err != nil {
+					errOnce.Do(func() { firstErr = res.err })
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+}
+
 // ReadDir returns all records of the LevelDB in dir, in file-number order.
 // Within a file, records keep their on-disk order.
 //
@@ -210,45 +255,9 @@ func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, []
 	}
 	sort.SliceStable(files, func(i, j int) bool { return files[i].number < files[j].number })
 
-	results := make([]fileResult, len(files))
-	var firstErr error
-	if len(files) > 0 {
-		workers := min(runtime.GOMAXPROCS(0), len(files))
-		workCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		var next atomic.Int64
-		var errOnce sync.Once
-		var wg sync.WaitGroup
-		for range workers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					i := int(next.Add(1) - 1)
-					if i >= len(files) {
-						return
-					}
-					if err := workCtx.Err(); err != nil {
-						results[i] = fileResult{err: err}
-						return
-					}
-					res := parseDataFile(workCtx, files[i])
-					results[i] = res
-					if res.err != nil {
-						errOnce.Do(func() { firstErr = res.err })
-						cancel()
-						return
-					}
-				}
-			}()
-		}
-		wg.Wait()
-	}
-	if err := ctx.Err(); err != nil {
+	results, err := parseFiles(ctx, files, parseDataFile)
+	if err != nil {
 		return nil, nil, err
-	}
-	if firstErr != nil {
-		return nil, nil, firstErr
 	}
 
 	var totalRecords, totalDamage int
