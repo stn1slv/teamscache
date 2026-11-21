@@ -30,38 +30,82 @@ You need a new Teams client that has been signed in at least once. Auto-discover
 
 ## Usage
 
+### Common workflows
+
+1. Read all cached messages in one chat (oldest first):
+
+   ```bash
+   teamscache conversations --limit 0       # find the conversation "id"
+   teamscache read "19:abc@thread.v2" --limit 0
+   ```
+
+2. Filter by account or WebView2 profile when you have multiple tenants or profiles:
+
+   ```bash
+   teamscache accounts                      # get "<tenantId>:<userId>"
+   teamscache overview --account "<tenantId>:<userId>"
+
+   teamscache profiles                      # get profile folder name
+   teamscache overview --profile "Default"
+   ```
+
+3. Save JSON output to a file (JSON goes to stdout, summary goes to stderr):
+
+   ```bash
+   teamscache read "19:abc@thread.v2" --limit 0 > chat.json
+   ```
+
+`teamscache` reads only messages stored in the local Teams desktop cache, not older history that Teams has not cached on disk. `read` returns messages oldest first; `recent`, `search`, `mentions`, and `overview` return newest first.
+
+### Commands
+
 ```bash
 teamscache accounts                      # tenant and user contexts in the cache
 teamscache profiles                      # discovered WebView2 cache profiles
 teamscache overview --days 7             # recent activity grouped by conversation
-teamscache recent --days 3               # messages of the last 3 days, newest first
+teamscache recent --days 7               # messages of the last 7 days, newest first
 teamscache mentions --unread             # @-mentions of you that are not read yet
 teamscache search "quarterly budget"     # text in message content or sender name, newest first
-teamscache conversations                 # chats and channels
-teamscache read "19:abc@thread.v2"       # last messages of one conversation
+teamscache conversations                 # chats and channels (id, title, type, last message)
+teamscache read "19:abc@thread.v2"       # last 50 messages of one conversation, oldest first
 teamscache dump                          # accounts, conversations, messages and mentions in one JSON object
 ```
 
 All commands print JSON to stdout and a short summary to stderr, for example `# 12 result(s), 0 record(s) skipped, 0 damaged section(s)`. Skipped records could not be decoded. Damaged sections are unreadable file sections or missing referenced blob files, and are counted separately.
 
-| Flag | Commands | Meaning |
-|------|----------|---------|
-| `--account <tenantId>:<userId>` | all | Only one account. The keys come from `teamscache accounts`. With `mcp`, every tool serves only this account. |
-| `--limit N` | most | Maximum number of results; `0` means no limit. |
-| `--days N` | `search`, `recent`, `mentions`, `overview`, `dump` | Only items of the last N days; `0` means all. |
-| `--leveldb PATH` | all | Read this cache folder instead of the auto-discovered one. |
-| `--profile NAME` | all | Choose a discovered WebView2 profile by folder name (see `teamscache profiles`). |
-| `--max-content N` | all | Characters of message content in mentions, the overview, `dump` and MCP results; `0` means no limit (default 600). |
-| `-v`, `--verbose` | all | Log details, such as skipped records, to stderr. |
+### Flags and defaults
+
+| Command | Flags and defaults |
+|---------|--------------------|
+| `conversations` | `--limit 50` |
+| `search QUERY` | `--limit 50`, `--days 0` |
+| `read CONVERSATION_ID` | `--limit 50` |
+| `recent` | `--limit 200`, `--days 7` |
+| `mentions` | `--limit 100`, `--days 0`, `--unread` (`false`) |
+| `overview` | `--days 7` |
+| `dump` | `--days 0` |
+| `mcp` | `--cache-ttl 180s` (Go duration, such as `180s` or `3m`) |
+
+In those command flags, `--limit N` sets the maximum number of results (`0` means no limit). `--days N` keeps only items from the last N days (`0` means all dates, and `--limit` still applies). `--unread` keeps only unread @-mentions.
+
+Global flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--account <tenantId>:<userId>` | Only one account. The keys come from `teamscache accounts`. With `mcp`, every tool serves only this account. |
+| `--leveldb PATH` | Read this cache folder instead of the auto-discovered one. Cannot be combined with `--profile`. |
+| `--profile NAME` | Choose a discovered WebView2 profile by folder name (see `teamscache profiles`). Cannot be combined with `--leveldb`. |
+| `--max-content N` | Characters of message content in CLI `mentions`, `overview`, `dump`, and all MCP results (`0` means no limit, default `600`). CLI `conversations`, `read`, `recent`, and `search` print full content. |
+| `-v`, `--verbose` | Log details, such as skipped records, to stderr. |
 
 Environment variables:
 
 | Variable | Meaning |
 |----------|---------|
-| `TEAMSCACHE_LEVELDB` | Default for `--leveldb`. |
-| `TEAMSCACHE_PROFILE` | Default for `--profile`. |
+| `TEAMSCACHE_LEVELDB` | Default for `--leveldb` (cannot be set with `TEAMSCACHE_PROFILE`). |
+| `TEAMSCACHE_PROFILE` | Default for `--profile` (cannot be set with `TEAMSCACHE_LEVELDB`). |
 | `TEAMSCACHE_MAX_CONTENT` | Default for `--max-content`. |
-| `TEAMSCACHE_CACHE_TTL` | Seconds the MCP server reuses a parsed cache (default 180). |
+| `TEAMSCACHE_CACHE_TTL` | Integer number of seconds the MCP server reuses a parsed cache (default `180`). |
 
 The cache has no general read or unread marker. The read state of @-mentions is the only read state it keeps, so `mentions --unread` is the reliable way to find what needs your attention.
 
@@ -77,16 +121,29 @@ The cache has no general read or unread marker. The read state of @-mentions is 
 }
 ```
 
-| Tool | Purpose |
-|------|---------|
-| `overview` | Who messaged you: recent activity grouped by conversation. A good first call. |
-| `recent_messages` | Messages of the last N days, newest first. |
-| `mentions` | @-mentions of you, with content and read state; `unread_only` filter. |
-| `unread_messages` | Your unread @-mentions. |
-| `search_messages` | Text search in content and sender names, with an optional `days` filter. |
-| `list_conversations` | Chats and channels with their titles. |
-| `read_conversation` | Last messages of one conversation. |
-| `list_accounts` | Accounts in the cache; use the `key` as the `account` filter. |
+Pass `--max-content 0` for full message content in MCP tool results, or `--account <tenantId>:<userId>` to serve only one account:
+
+```json
+{
+  "mcpServers": {
+    "teams": {
+      "command": "teamscache",
+      "args": ["mcp", "--max-content", "0", "--account", "<tenantId>:<userId>"]
+    }
+  }
+}
+```
+
+| Tool | Purpose | Key arguments and defaults |
+|------|---------|----------------------------|
+| `overview` | Who messaged you: recent activity grouped by conversation. A good first call. | `days` (`7`), `limit` (`100`), `account` |
+| `recent_messages` | Messages of the last N days, newest first. | `days` (`7`), `limit` (`200`), `account` |
+| `mentions` | @-mentions of you, with content and read state. | `days` (`0`), `unread_only` (`false`), `limit` (`100`), `account` |
+| `unread_messages` | Your unread @-mentions. | `days` (`30`), `limit` (`100`), `account` |
+| `search_messages` | Text search in content and sender names. | `query` (required), `days` (`0`), `limit` (`50`), `account` |
+| `list_conversations` | Chats and channels with their titles and IDs. | `limit` (`100`), `account` |
+| `read_conversation` | Last messages of one conversation, oldest first. Pass `limit: 0` for all cached messages. | `conversation_id` (required), `limit` (`50`), `account` |
+| `list_accounts` | Accounts in the cache; use `key` as the `account` filter. | none |
 
 The server parses the cache on the first tool call and keeps the result in memory. It parses again when the TTL ends or when Teams writes new data.
 
