@@ -11,8 +11,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
-	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -20,9 +18,6 @@ import (
 
 	"github.com/stn1slv/teamscache/internal/leveldb"
 )
-
-// ErrNotFound reports a database or object store that does not exist.
-var ErrNotFound = errors.New("not found")
 
 // Metadata type bytes.
 const (
@@ -203,19 +198,25 @@ func (db *DB) readMetadata() {
 	}
 }
 
-// ObjectStoreID returns the lowest id of an object store with the given name,
-// among the ids from 1 to the database's highest store id.
-func (db *DB) ObjectStoreID(dbNumber uint64, name string) (uint64, error) {
-	var best uint64
+// ObjectStoreIDs returns the ids of the object stores whose name match
+// accepts, in ascending order, among the ids from 1 to the database's highest
+// store id. When several stores have the same name, only the lowest id counts.
+func (db *DB) ObjectStoreIDs(dbNumber uint64, match func(name string) bool) []uint64 {
+	lowest := map[string]uint64{}
 	for id, n := range db.storeNames[dbNumber] {
-		if n == name && id >= 1 && id <= db.maxStoreID[dbNumber] && (best == 0 || id < best) {
-			best = id
+		if id < 1 || id > db.maxStoreID[dbNumber] || !match(n) {
+			continue
+		}
+		if best, ok := lowest[n]; !ok || id < best {
+			lowest[n] = id
 		}
 	}
-	if best != 0 {
-		return best, nil
+	ids := make([]uint64, 0, len(lowest))
+	for _, id := range lowest {
+		ids = append(ids, id)
 	}
-	return 0, fmt.Errorf("object store %q in database %d: %w", name, dbNumber, ErrNotFound)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // makePrefix encodes a key prefix: one byte with the sizes of the three ids,

@@ -96,7 +96,7 @@ The new Teams client (`com.microsoft.teams2` on macOS, the `MSTeams` package on 
 2. copies its data files and referenced blob files to a temporary folder, because the running client locks the files, and removes the copy when it is done,
 3. reads the LevelDB files directly (tables and logs, including Snappy-compressed blocks), without a LevelDB engine,
 4. decodes the IndexedDB keys and the Blink and V8 values,
-5. maps the Teams schema: messages in `replychains`, chats in `conversations`, mentions in `mentions-metadata-items`, one database set per tenant and user.
+5. maps the Teams schema: messages in `replychains` and its numbered copies such as `replychains-2`, chats in `conversations`, mentions in `mentions-metadata-items`, one database set per tenant and user.
 
 LevelDB can keep older versions of a record until it compacts its files. `teamscache` uses only the newest version of each record, so an edited message shows its current text and the read state of a mention is the current one.
 

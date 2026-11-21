@@ -88,18 +88,27 @@ func TestFixtureMatchesCCL(t *testing.T) {
 	assert.JSONEq(t, string(golden), string(gotJSON))
 }
 
-func TestObjectStoreID(t *testing.T) {
+func TestObjectStoreIDs(t *testing.T) {
 	t.Parallel()
 	fixture := filepath.Join("testdata", "fixture")
 	db, err := Open(context.Background(), filepath.Join(fixture, "leveldb"), "", slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
+	named := func(want string) func(string) bool { return func(n string) bool { return n == want } }
 
-	id, err := db.ObjectStoreID(1, "wrapped")
-	require.NoError(t, err)
-	assert.Equal(t, uint64(2), id)
+	assert.Equal(t, []uint64{2}, db.ObjectStoreIDs(1, named("wrapped")))
+	assert.Empty(t, db.ObjectStoreIDs(1, named("missing")))
+}
 
-	_, err = db.ObjectStoreID(1, "missing")
-	require.ErrorIs(t, err, ErrNotFound)
+func TestObjectStoreIDsInAscendingOrder(t *testing.T) {
+	t.Parallel()
+	db := &DB{
+		storeNames: map[uint64]map[uint64]string{1: {4: "b", 1: "a", 3: "a", 2: "c", 9: "d", 0: "z"}},
+		maxStoreID: map[uint64]uint64{1: 4},
+	}
+
+	got := db.ObjectStoreIDs(1, func(n string) bool { return n != "c" })
+
+	assert.Equal(t, []uint64{1, 4}, got, "the lowest id of a repeated name, and no id below 1 or above the highest store id")
 }
 
 func TestBlobValueWithoutBlobFolderIsBad(t *testing.T) {

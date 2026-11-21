@@ -4,7 +4,8 @@
 // The Teams client keeps recent conversations in a Chromium IndexedDB backed
 // by LevelDB. Each (tenant, user) context has its own databases, named
 // "Teams:<manager>:react-web-client:<tenantId>:<userObjectId>:<locale>":
-//   - messages: "Teams:replychain-manager:..." store "replychains", each record
+//   - messages: "Teams:replychain-manager:..." store "replychains" and its
+//     numbered copies such as "replychains-2", each record
 //     has a "messageMap" of message id to message,
 //   - chats and channels: "Teams:conversation-manager:..." store "conversations",
 //   - @-mentions: "Teams:messaging-slice-manager:..." store
@@ -314,21 +315,56 @@ type storeRecord struct {
 	seq    uint64
 	live   bool
 	value  any
-	failed bool // the value could not be decoded
+	failed bool   // the value could not be decoded
+	store  uint64 // the object store id, when known
 }
 
 // storeFunc yields, for each context of a manager in database order, the
-// account and every record version of one object store.
+// account and every record version of one object store and its numbered
+// copies, each tagged with its store.
 type storeFunc func(manager, store string) iter.Seq2[Account, iter.Seq[storeRecord]]
 
-// current keeps the newest version of each record and drops records whose
-// newest version is a deletion or could not be decoded; an older version is
-// never shown in place of a newer one. Records keep the order of their first
+type storeKey struct {
+	store uint64
+	key   string
+}
+
+// latest keeps, in each store, the newest version of each record, and drops a
+// record whose newest version in that store is a deletion. A deletion counts
+// only in its own store: this keeps records that Teams moved to another
+// store, but an older live copy can come back after a real deletion. A
+// version that could not be decoded is kept, so it still hides older
+// versions. Records keep the order of their first version.
+func latest(records iter.Seq[storeRecord]) []storeRecord {
+	var order []storeKey
+	newest := map[storeKey]storeRecord{}
+	for r := range records {
+		k := storeKey{store: r.store, key: r.key}
+		old, seen := newest[k]
+		if !seen {
+			order = append(order, k)
+		}
+		if !seen || r.seq >= old.seq {
+			newest[k] = r
+		}
+	}
+	out := make([]storeRecord, 0, len(order))
+	for _, k := range order {
+		if r := newest[k]; r.live {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// current keeps the newest version of each record across stores, as chosen by
+// latest, and drops it when it could not be decoded; an older version is never
+// shown in place of a newer one. Records keep the order of their first
 // version.
 func current(records iter.Seq[storeRecord]) []storeRecord {
 	var order []string
 	newest := map[string]storeRecord{}
-	for r := range records {
+	for _, r := range latest(records) {
 		old, seen := newest[r.key]
 		if !seen {
 			order = append(order, r.key)
@@ -339,13 +375,37 @@ func current(records iter.Seq[storeRecord]) []storeRecord {
 	}
 	out := make([]storeRecord, 0, len(order))
 	for _, k := range order {
-		if r := newest[k]; r.live && !r.failed && r.value != nil {
+		if r := newest[k]; !r.failed && r.value != nil {
 			out = append(out, r)
 		}
 	}
 	return out
 }
 
+// numberedStore matches the name of a numbered copy of a store, such as
+// "replychains-2". Teams also writes records to such stores, and some
+// messages are only there.
+var numberedStore = regexp.MustCompile(`^(.+)-\d+$`)
+
+// isStore reports whether name is store or a numbered copy of it.
+func isStore(name, store string) bool {
+	m := numberedStore.FindStringSubmatch(name)
+	return name == store || (m != nil && m[1] == store)
+}
+
+// records yields every record version of one object store.
+func (r *Reader) records(dbNumber, storeID uint64) iter.Seq[storeRecord] {
+	return func(yield func(storeRecord) bool) {
+		for rec := range r.db.Records(dbNumber, storeID, r.onBad) {
+			if !yield(storeRecord{key: string(rec.Key), seq: rec.Seq, live: rec.Live, value: rec.Value, failed: rec.Err != nil, store: storeID}) {
+				return
+			}
+		}
+	}
+}
+
+// stores yields, for each database of manager, the account and the record
+// versions of store and of its numbered copies, in store id order.
 func (r *Reader) stores(manager, store string) iter.Seq2[Account, iter.Seq[storeRecord]] {
 	return func(yield func(Account, iter.Seq[storeRecord]) bool) {
 		for _, d := range r.db.Databases() {
@@ -359,14 +419,16 @@ func (r *Reader) stores(manager, store string) iter.Seq2[Account, iter.Seq[store
 				continue
 			}
 			acc := Account{TenantID: parts[len(parts)-3], UserID: parts[len(parts)-2]}
-			storeID, err := r.db.ObjectStoreID(d.Number, store)
-			if err != nil {
+			storeIDs := r.db.ObjectStoreIDs(d.Number, func(name string) bool { return isStore(name, store) })
+			if len(storeIDs) == 0 {
 				continue
 			}
 			values := func(yieldRecord func(storeRecord) bool) {
-				for rec := range r.db.Records(d.Number, storeID, r.onBad) {
-					if !yieldRecord(storeRecord{key: string(rec.Key), seq: rec.Seq, live: rec.Live, value: rec.Value, failed: rec.Err != nil}) {
-						return
+				for _, storeID := range storeIDs {
+					for rec := range r.records(d.Number, storeID) {
+						if !yieldRecord(rec) {
+							return
+						}
 					}
 				}
 			}
@@ -387,8 +449,11 @@ func (r *Reader) Accounts() []Account {
 	return accounts(r.stores)
 }
 
-// Messages returns the messages of the newest version of each reply chain,
-// optionally only those of one account key.
+// Messages returns the messages of the newest version of each reply chain in
+// each store, optionally only those of one account key. A message found in
+// several stores is returned once, from the chain version with the highest
+// sequence number; it is left out when that version has no text. A chain
+// version that could not be decoded hides the older versions of that chain.
 func (r *Reader) Messages(account string) []Message {
 	return messages(r.stores, account)
 }
@@ -414,12 +479,26 @@ func accounts(stores storeFunc) []Account {
 }
 
 func messages(stores storeFunc, account string) []Message {
-	var out []Message
+	type messageKey struct{ account, conversation, id, entry string }
+	var found []Message
+	index := map[messageKey]int{}
 	for acc, values := range stores("replychain-manager", "replychains") {
 		if account != "" && acc.Key() != account {
 			continue
 		}
-		for _, version := range current(values) {
+		// Each store's copy of a chain can hold other messages, so the
+		// copies are merged by message id rather than by chain.
+		versions := latest(values)
+		hiddenBelow := map[string]uint64{}
+		for _, v := range versions {
+			if v.failed && v.seq > hiddenBelow[v.key] {
+				hiddenBelow[v.key] = v.seq
+			}
+		}
+		for _, version := range versions {
+			if version.failed || version.seq < hiddenBelow[version.key] {
+				continue
+			}
 			rec, ok := version.value.(*v8.Object)
 			if !ok {
 				continue
@@ -433,22 +512,36 @@ func messages(stores storeFunc, account string) []Message {
 				if !ok {
 					continue
 				}
-				content := messageText(msg)
-				if content == "" {
-					continue
-				}
-				out = append(out, Message{
+				m := Message{
 					Account:        acc.Key(),
 					ConversationID: valueString(getOr(rec, "conversationId", "")),
 					ReplyChainID:   valueString(getOr(rec, "replyChainId", "")),
 					MessageID:      valueString(getOr(msg, "id", mid)),
 					Sender:         text(or(get(msg, "imDisplayName"), get(msg, "from"))),
 					Timestamp:      valueString(or(or(get(msg, "originalArrivalTime"), get(msg, "composetime")), "")),
-					Content:        content,
+					Content:        messageText(msg),
 					ContentType:    valueString(or(get(msg, "messageType"), "")),
 					Seq:            version.seq,
-				})
+				}
+				k := messageKey{account: m.Account, conversation: m.ConversationID, id: m.MessageID}
+				if m.MessageID == "" { // without an id, only the same entry of the same chain is the same message
+					k.entry = version.key + "\x00" + valueString(mid)
+				}
+				// The newest version wins before the text is checked, so an
+				// emptied message does not show its older text.
+				if i, seen := index[k]; !seen {
+					index[k] = len(found)
+					found = append(found, m)
+				} else if m.Seq >= found[i].Seq {
+					found[i] = m
+				}
 			}
+		}
+	}
+	var out []Message
+	for _, m := range found {
+		if m.Content != "" {
+			out = append(out, m)
 		}
 	}
 	return out
