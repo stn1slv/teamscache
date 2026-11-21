@@ -1,6 +1,7 @@
 package v8
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"math"
@@ -91,7 +92,7 @@ func TestCorpusMatchesCCL(t *testing.T) {
 			var want any
 			require.NoError(t, json.Unmarshal(golden, &want))
 
-			value, err := Deserialize(data, nil)
+			value, err := Deserialize(context.Background(), data, nil)
 
 			if m, ok := want.(map[string]any); ok && m["$error"] == true {
 				require.Error(t, err)
@@ -135,7 +136,7 @@ func TestKnownDifferencesFromCCL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := Deserialize(mustHex(t, tt.data), nil)
+			got, err := Deserialize(context.Background(), mustHex(t, tt.data), nil)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
@@ -159,7 +160,7 @@ func TestDeserializeErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := Deserialize(mustHex(t, tt.data), nil)
+			_, err := Deserialize(context.Background(), mustHex(t, tt.data), nil)
 			require.Error(t, err)
 		})
 	}
@@ -180,7 +181,7 @@ func TestBlinkHostObjects(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := Deserialize(mustHex(t, tt.data), ReadBlinkHostObject)
+			got, err := Deserialize(context.Background(), mustHex(t, tt.data), ReadBlinkHostObject)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
@@ -211,17 +212,17 @@ func TestObjectKeys(t *testing.T) {
 func TestArrayLimits(t *testing.T) {
 	t.Parallel()
 	// A dense array that claims 2^28 elements in a few bytes.
-	_, err := Deserialize(mustHex(t, "ff0f 41 80808080 01"), nil)
+	_, err := Deserialize(context.Background(), mustHex(t, "ff0f 41 80808080 01"), nil)
 	require.ErrorIs(t, err, ErrInvalid)
 	// A sparse array longer than the cap.
-	_, err = Deserialize(mustHex(t, "ff0f 61 80808080 01 40 00 00"), nil)
+	_, err = Deserialize(context.Background(), mustHex(t, "ff0f 61 80808080 01 40 00 00"), nil)
 	require.ErrorIs(t, err, ErrUnsupported)
 }
 
 func TestMapWithBooleanAndNumberKeys(t *testing.T) {
 	t.Parallel()
 	// new Map([[true, "t"], [1, "one"]]) from Node's v8.serialize.
-	got, err := Deserialize(mustHex(t, "ff0f 3b 54 22 01 74 49 02 22 03 6f 6e 65 3a 04"), nil)
+	got, err := Deserialize(context.Background(), mustHex(t, "ff0f 3b 54 22 01 74 49 02 22 03 6f 6e 65 3a 04"), nil)
 
 	require.NoError(t, err)
 	m, ok := got.(*Object)
@@ -239,7 +240,32 @@ func TestAllocationBudgetIsPerValue(t *testing.T) {
 	}
 	data = append(data, '$', 0, 64)
 
-	_, err := Deserialize(data, nil)
+	_, err := Deserialize(context.Background(), data, nil)
 
 	require.ErrorIs(t, err, ErrUnsupported)
+}
+
+func TestCollectionPropertiesRespectAllocationBudget(t *testing.T) {
+	t.Parallel()
+	for _, data := range []string{"6f 22 01 6b 30 7b 01", "3b 22 01 6b 30 3a 02", "27 30 2c 01"} {
+		d := &Deserializer{ctx: context.Background(), data: mustHex(t, data), version: 15, slots: maxSlots}
+		_, err := d.readObject()
+		require.ErrorIs(t, err, ErrUnsupported)
+	}
+}
+
+func TestDeserializeStopsWhenCanceled(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := Deserialize(ctx, mustHex(t, "ff0f 30"), nil)
+	require.ErrorIs(t, err, context.Canceled)
+
+	ctx, cancel = context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	_, err = Deserialize(ctx, mustHex(t, "ff0f 5c 69 00"), func(*Deserializer) (any, error) {
+		cancel()
+		return nil, nil
+	})
+	require.ErrorIs(t, err, context.Canceled, "cancellation during decoding is not a bad-value error")
 }

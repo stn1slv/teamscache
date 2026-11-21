@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -20,6 +21,11 @@ func connect(t *testing.T, account string) *mcp.ClientSession {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "sample.leveldb")
 	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	return connectCache(t, account, dir)
+}
+
+func connectCache(t *testing.T, account, dir string) *mcp.ClientSession {
+	t.Helper()
 	cache := service.NewCache(dir, time.Minute, slog.New(slog.DiscardHandler))
 	server := New(cache, service.Options{MaxContent: 6, Now: time.Now}, "test", account)
 
@@ -66,9 +72,15 @@ func callTool(t *testing.T, session *mcp.ClientSession, name string, args map[st
 	raw, err := json.Marshal(res.StructuredContent)
 	require.NoError(t, err)
 	var out struct {
-		Result []map[string]any `json:"result"`
+		Result          []map[string]any `json:"result"`
+		Partial         bool             `json:"partial"`
+		SkippedRecords  int              `json:"skipped_records"`
+		DamagedSections json.RawMessage  `json:"damaged_sections"`
 	}
 	require.NoError(t, json.Unmarshal(raw, &out))
+	assert.False(t, out.Partial)
+	assert.Zero(t, out.SkippedRecords)
+	assert.JSONEq(t, "[]", string(out.DamagedSections))
 	return out.Result
 }
 
@@ -140,4 +152,62 @@ func TestNegativeLimitIsRejected(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, res.IsError)
+}
+
+func TestEveryToolReportsPartialResults(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	require.NoError(t, idbtest.Write(dir, "", []idbtest.Database{{
+		Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+		Stores: []idbtest.Store{{Name: "replychains", Records: []idbtest.Record{
+			{Key: "bad", Value: "bad", Wrapping: idbtest.Corrupt},
+		}}},
+	}}))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "999999.ldb"), []byte("corrupt"), 0o600))
+	session := connectCache(t, "", dir)
+	for _, name := range []string{
+		"list_accounts", "list_conversations", "read_conversation", "search_messages",
+		"recent_messages", "mentions", "unread_messages", "overview",
+	} {
+		args := map[string]any{}
+		if name == "read_conversation" {
+			args["conversation_id"] = "c"
+		}
+		if name == "search_messages" {
+			args["query"] = "x"
+		}
+		response, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+		require.NoError(t, err)
+		require.False(t, response.IsError, name)
+		raw, err := json.Marshal(response.StructuredContent)
+		require.NoError(t, err)
+		var diagnostics struct {
+			Partial         bool             `json:"partial"`
+			SkippedRecords  int              `json:"skipped_records"`
+			DamagedSections []map[string]any `json:"damaged_sections"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &diagnostics))
+		assert.True(t, diagnostics.Partial, name)
+		assert.Equal(t, 1, diagnostics.SkippedRecords, name)
+		require.Len(t, diagnostics.DamagedSections, 1, name)
+		assert.Equal(t, "999999.ldb", diagnostics.DamagedSections[0]["file"], name)
+	}
+}
+
+func TestEveryToolReportsCompleteResults(t *testing.T) {
+	t.Parallel()
+	session := connect(t, "")
+	for _, name := range []string{
+		"list_accounts", "list_conversations", "read_conversation", "search_messages",
+		"recent_messages", "mentions", "unread_messages", "overview",
+	} {
+		args := map[string]any{}
+		if name == "read_conversation" {
+			args["conversation_id"] = "c1"
+		}
+		if name == "search_messages" {
+			args["query"] = "budget"
+		}
+		callTool(t, session, name, args)
+	}
 }

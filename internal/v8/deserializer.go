@@ -1,6 +1,7 @@
 package v8
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -63,13 +64,14 @@ const (
 // HostObjectReader decodes the data after a host object tag.
 type HostObjectReader func(d *Deserializer) (any, error)
 
-// maxSlots is the number of array, list and typed array elements one value
+// maxSlots is the number of collection elements and property slots one value
 // may allocate in total. It stops small corrupt values from claiming large
 // amounts of memory through many arrays.
 const maxSlots = 1 << 22
 
 // Deserializer reads one value from V8 serialized data.
 type Deserializer struct {
+	ctx     context.Context
 	data    []byte
 	pos     int
 	version uint64
@@ -94,9 +96,16 @@ func (d *Deserializer) remaining() uint64 { return uint64(len(d.data) - d.pos) }
 // Deserialize decodes the value in data, which starts with the V8 version
 // header. host decodes host objects; it may be nil when none are expected.
 // Data after the value is ignored.
-func Deserialize(data []byte, host HostObjectReader) (any, error) {
-	d := &Deserializer{data: data, host: host}
-	if d.readTag() != tagVersion {
+func Deserialize(ctx context.Context, data []byte, host HostObjectReader) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	d := &Deserializer{ctx: ctx, data: data, host: host}
+	tag := d.readTag()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if tag != tagVersion {
 		return nil, fmt.Errorf("%w: missing version header", ErrInvalid)
 	}
 	version, err := d.ReadVarint()
@@ -157,6 +166,9 @@ func (d *Deserializer) ReadByte() (byte, error) {
 // readTag returns the next tag, skipping padding, or tagEndOfData.
 func (d *Deserializer) readTag() int {
 	for d.pos < len(d.data) {
+		if d.pos%4096 == 0 && d.ctx.Err() != nil {
+			return tagEndOfData
+		}
 		t := d.data[d.pos]
 		d.pos++
 		if t != tagPadding {
@@ -182,12 +194,18 @@ func (d *Deserializer) readDouble() (float64, error) {
 }
 
 func (d *Deserializer) readObject() (any, error) {
+	if err := d.ctx.Err(); err != nil {
+		return nil, err
+	}
 	d.depth++
 	defer func() { d.depth-- }()
 	if d.depth > maxNestingDepth {
 		return nil, fmt.Errorf("%w: nesting too deep", ErrInvalid)
 	}
 	value, err := d.readObjectInternal()
+	if ctxErr := d.ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -328,6 +346,9 @@ func (d *Deserializer) readBigInt() (*big.Int, error) {
 	// Digits are little-endian; big.Int wants big-endian bytes.
 	be := make([]byte, len(raw))
 	for i, b := range raw {
+		if i%4096 == 0 && d.ctx.Err() != nil {
+			return nil, d.ctx.Err()
+		}
 		be[len(raw)-1-i] = b
 	}
 	v := new(big.Int).SetBytes(be)
@@ -364,6 +385,9 @@ func (d *Deserializer) readOneByteString() (string, error) {
 	}
 	runes := make([]rune, len(raw))
 	for i, b := range raw {
+		if i%4096 == 0 && d.ctx.Err() != nil {
+			return "", d.ctx.Err()
+		}
 		runes[i] = rune(b)
 	}
 	return string(runes), nil
@@ -385,6 +409,9 @@ func (d *Deserializer) readTwoByteString() (string, error) {
 	}
 	units := make([]uint16, len(raw)/2)
 	for i := range units {
+		if i%4096 == 0 && d.ctx.Err() != nil {
+			return "", d.ctx.Err()
+		}
 		units[i] = binary.LittleEndian.Uint16(raw[2*i:])
 	}
 	return string(utf16.Decode(units)), nil
@@ -428,6 +455,9 @@ func (d *Deserializer) readProperties(endTag int, add func(key, value any) error
 			return nil
 		case tagEndOfData:
 			return fmt.Errorf("%w: data ends inside an object", ErrInvalid)
+		}
+		if err := d.reserve(2); err != nil {
+			return err
 		}
 		key, err := d.readObject()
 		if err != nil {
@@ -594,6 +624,9 @@ func (d *Deserializer) readJSSet() (any, error) {
 		case tagEndOfData:
 			return nil, fmt.Errorf("%w: data ends inside a set", ErrInvalid)
 		}
+		if err := d.reserve(1); err != nil {
+			return nil, err
+		}
 		v, err := d.readObject()
 		if err != nil {
 			return nil, err
@@ -656,6 +689,9 @@ func (d *Deserializer) readArrayBufferView(buffer any) (any, error) {
 	}
 	items := make([]any, 0, len(data)/format.size)
 	for i := 0; i < len(data); i += format.size {
+		if i%4096 == 0 && d.ctx.Err() != nil {
+			return nil, d.ctx.Err()
+		}
 		items = append(items, format.decode(data[i:i+format.size]))
 	}
 	// V8 gives the view its own object id.

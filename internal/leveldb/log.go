@@ -2,6 +2,7 @@ package leveldb
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 )
 
@@ -36,7 +37,7 @@ type logBatch struct {
 // read, the rest of it is skipped and reading resumes at the next block.
 // Zero-filled space ends a block quietly and is only reported when it cuts a
 // record short or has data after it.
-func readLogBatches(data []byte) ([]logBatch, []logDamage) {
+func readLogBatches(ctx context.Context, data []byte) ([]logBatch, []logDamage, error) {
 	var (
 		batches     []logBatch
 		damage      []logDamage
@@ -56,6 +57,9 @@ func readLogBatches(data []byte) ([]logBatch, []logDamage) {
 	}
 
 	for blockOffset := 0; blockOffset < len(data); blockOffset += logBlockSize {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		block := data[blockOffset:min(blockOffset+logBlockSize, len(data))]
 		atEOF := len(block) < logBlockSize
 		pos := 0
@@ -83,6 +87,11 @@ func readLogBatches(data []byte) ([]logBatch, []logDamage) {
 			}
 
 			frag := block[dataStart : dataStart+length]
+			if maskedCRC(block[pos+6:dataStart+length]) != binary.LittleEndian.Uint32(block[pos:]) {
+				abandon(headerOffset, "record interrupted by a checksum mismatch")
+				skip(headerOffset, int64(len(block)-pos), "checksum mismatch")
+				break
+			}
 			pos = dataStart + length
 
 			switch fragType {
@@ -112,7 +121,7 @@ func readLogBatches(data []byte) ([]logBatch, []logDamage) {
 		}
 	}
 	abandon(int64(len(data)), "incomplete record at the end of the file")
-	return batches, damage
+	return batches, damage, nil
 }
 
 // parseLog returns the records of a .log file and the stretches it skipped.
@@ -120,8 +129,14 @@ func readLogBatches(data []byte) ([]logBatch, []logDamage) {
 // A write batch is: sequence (8 bytes), count (4 bytes), then count entries of
 // type (1 byte), varint-prefixed key and, for live entries, varint-prefixed
 // value. Entry i of a batch gets sequence number seq+i.
-func parseLog(data []byte, path string) ([]Record, []logDamage) {
-	batches, damage := readLogBatches(data)
+func parseLog(ctx context.Context, data []byte, path string) ([]Record, []logDamage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	batches, damage, err := readLogBatches(ctx, data)
+	if err != nil {
+		return nil, nil, err
+	}
 	var records []Record
 	for _, b := range batches {
 		if len(b.data) < 12 {
@@ -132,6 +147,9 @@ func parseLog(data []byte, path string) ([]Record, []logDamage) {
 		count := binary.LittleEndian.Uint32(b.data[8:])
 		pos := 12
 		for i := uint32(0); i < count; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
 			start := pos
 			state, key, value, n := readBatchEntry(b.data[pos:])
 			if n == 0 {
@@ -149,7 +167,7 @@ func parseLog(data []byte, path string) ([]Record, []logDamage) {
 			})
 		}
 	}
-	return records, damage
+	return records, damage, nil
 }
 
 // readBatchEntry reads one write-batch entry. It returns n == 0 when the

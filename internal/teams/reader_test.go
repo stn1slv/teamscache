@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/stn1slv/teamscache/internal/idbtest"
+	"github.com/stn1slv/teamscache/internal/leveldb"
 	"github.com/stn1slv/teamscache/internal/v8"
 )
 
@@ -186,6 +188,19 @@ func TestMessageFields(t *testing.T) {
 	assert.Equal(t, "RichText/Html", got[1].ContentType)
 }
 
+func TestPlainMessagesAndConversationPreviewsKeepMarkup(t *testing.T) {
+	t.Parallel()
+	body := "Keep <placeholder> &amp; x < 5 > 3"
+	message := obj("content", body, "messageType", "Text")
+	record := obj("messageMap", obj("m", message), "lastMessage", message)
+	msgs := messages(fakeStores(record), "")
+	convs := conversations(fakeStores(record), "")
+	require.Len(t, msgs, 1)
+	require.Len(t, convs, 1)
+	assert.Equal(t, body, msgs[0].Content)
+	assert.Equal(t, body, convs[0].LastMessage)
+}
+
 func TestMentionReadState(t *testing.T) {
 	t.Parallel()
 	got := mentions(fakeStores(
@@ -230,21 +245,128 @@ func TestOpenReadsASyntheticCache(t *testing.T) {
 	require.NoError(t, err)
 	tmp := r.tmp
 	t.Cleanup(r.Close)
+	require.NoError(t, os.Remove(filepath.Join(root, "cache.blob", "1", "00", "1")))
 
 	assert.Equal(t, []Account{{TenantID: "t1", UserID: "user-t1"}}, r.Accounts())
 	msgs := r.Messages("")
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "Ann Lee (Org)", msgs[0].Sender)
 	assert.Equal(t, "Hello", msgs[0].Content)
-	assert.Equal(t, "big", msgs[1].Content, "values in blob files are read from the original folder")
+	assert.Equal(t, "big", msgs[1].Content, "blob values remain readable after the original file is removed")
 	assert.Empty(t, r.Messages("other:account"))
 	assert.Equal(t, "Project", r.Conversations("")[0].Title)
 	assert.Equal(t, []Mention{{Account: "t1:user-t1", ConversationID: "c1", MessageID: "m1", ReplyChainID: "", Timestamp: "", IsRead: false}}, r.Mentions(""))
 	assert.Equal(t, 1, r.Skipped())
+	assert.Empty(t, r.Damage())
 
 	r.Close()
 	_, err = os.Stat(tmp)
 	assert.True(t, os.IsNotExist(err), "Close removes the temporary copy")
+}
+
+func TestMissingBlobProducesPartialResults(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, blobs := filepath.Join(root, "cache.leveldb"), filepath.Join(root, "cache.blob")
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	require.NoError(t, idbtest.Write(dir, blobs, []idbtest.Database{{
+		Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+		Stores: []idbtest.Store{{Name: "replychains", Records: []idbtest.Record{
+			{Key: "r", Wrapping: idbtest.Blob, Value: idbtest.Obj{
+				p("messageMap", idbtest.Obj{p("m", idbtest.Obj{p("content", "message")})}),
+			}},
+		}}},
+	}}))
+	require.NoError(t, os.Remove(filepath.Join(blobs, "1", "00", "1")))
+
+	r, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+	assert.Empty(t, r.Messages(""))
+	assert.Equal(t, 1, r.Skipped())
+	require.Len(t, r.Damage(), 1)
+	assert.Equal(t, "referenced blob is missing", r.Damage()[0].Reason)
+}
+
+func TestCopyFileStopsWhenCanceled(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	src, dst := filepath.Join(root, "source"), filepath.Join(root, "copy")
+	require.NoError(t, os.WriteFile(src, []byte("data"), 0o600))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, copyFile(ctx, src, dst, 0), context.Canceled)
+	_, err := os.Stat(dst)
+	assert.True(t, os.IsNotExist(err), "a canceled copy does not create an output file")
+}
+
+func TestOpenSkipsOversizedAndUnreadableBlobs(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"oversized", "unreadable"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			dir, blobs := filepath.Join(root, "cache.leveldb"), filepath.Join(root, "cache.blob")
+			p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+			value := idbtest.Obj{p("messageMap", idbtest.Obj{p("m", idbtest.Obj{p("content", "message")})})}
+			require.NoError(t, idbtest.Write(dir, blobs, []idbtest.Database{{
+				Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+				Stores: []idbtest.Store{{Name: "replychains", Records: []idbtest.Record{
+					{Key: "good", Value: value},
+					{Key: "blob", Value: value, Wrapping: idbtest.Blob},
+				}}},
+			}}))
+			source := filepath.Join(blobs, "1", "00", "1")
+			if kind == "oversized" {
+				require.NoError(t, os.Truncate(source, leveldb.MaxDecodedSize+1))
+			} else {
+				require.NoError(t, os.Remove(source))
+				require.NoError(t, os.Mkdir(source, 0o700))
+			}
+
+			r, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+
+			require.NoError(t, err)
+			t.Cleanup(r.Close)
+			assert.Len(t, r.Messages(""), 1, "an unusable source blob does not hide other messages")
+			assert.Equal(t, 1, r.Skipped())
+			require.Len(t, r.Damage(), 1)
+			if kind == "oversized" {
+				assert.Contains(t, r.Damage()[0].Reason, "size limit")
+			}
+			_, err = os.Stat(filepath.Join(r.tmp, "blobs", "1", "00", "1"))
+			assert.True(t, os.IsNotExist(err), "rejected or incomplete blob copies are removed")
+		})
+	}
+}
+
+func TestCopyFileLimitsAndDestinationErrors(t *testing.T) {
+	t.Parallel()
+	for _, size := range []int{7, 8, 9} {
+		root := t.TempDir()
+		src, dst := filepath.Join(root, "source"), filepath.Join(root, "copy")
+		require.NoError(t, os.WriteFile(src, []byte(strings.Repeat("x", size)), 0o600))
+		err := copyFile(context.Background(), src, dst, 8)
+		if size > 8 {
+			require.ErrorIs(t, err, ErrBlobTooLarge)
+			_, statErr := os.Stat(dst)
+			assert.True(t, os.IsNotExist(statErr))
+		} else {
+			require.NoError(t, err)
+			info, statErr := os.Stat(dst)
+			require.NoError(t, statErr)
+			assert.EqualValues(t, size, info.Size())
+		}
+	}
+	root := t.TempDir()
+	src, dst := filepath.Join(root, "source"), filepath.Join(root, "destination")
+	require.NoError(t, os.WriteFile(src, []byte("data"), 0o600))
+	require.NoError(t, os.Mkdir(dst, 0o700))
+	err := copyFile(context.Background(), src, dst, 8)
+	require.Error(t, err)
+	var sourceErr *sourceReadError
+	assert.NotErrorAs(t, err, &sourceErr, "destination failures remain fatal")
 }
 
 func TestOpenWithoutCache(t *testing.T) {

@@ -3,6 +3,7 @@ package indexeddb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stn1slv/teamscache/internal/idbtest"
 	"github.com/stn1slv/teamscache/internal/leveldb"
 	"github.com/stn1slv/teamscache/internal/v8"
 )
@@ -184,7 +186,7 @@ func TestDatabaseListedOnce(t *testing.T) {
 	t.Parallel()
 	key := []byte{0, 0, 0, 0, 0xc9, 1, 0, 'o', 1, 0, 'n'}
 	tableKey := append(append([]byte{}, key...), 1, 5, 0, 0, 0, 0, 0, 0) // live, sequence 5
-	db := &DB{records: []leveldb.Record{
+	db := &DB{ctx: context.Background(), records: []leveldb.Record{
 		{Key: tableKey, Value: []byte{1}, Seq: 5, State: leveldb.Live, FileType: leveldb.Ldb},
 		{Key: key, Value: []byte{1}, Seq: 9, State: leveldb.Live, FileType: leveldb.Log},
 	}}
@@ -197,7 +199,7 @@ func TestDatabaseListedOnce(t *testing.T) {
 func TestDeletedMetadataStaysDeleted(t *testing.T) {
 	t.Parallel()
 	key := []byte{0, 0, 0, 0, 0xc9, 1, 0, 'o', 1, 0, 'n'}
-	db := &DB{records: []leveldb.Record{
+	db := &DB{ctx: context.Background(), records: []leveldb.Record{
 		{Key: key, Value: []byte{1}, Seq: 5, State: leveldb.Live, FileType: leveldb.Log},
 		{Key: key, Seq: 7, State: leveldb.Deleted, FileType: leveldb.Log},
 	}}
@@ -211,7 +213,7 @@ func TestBlobEntryWithHighestSequenceWins(t *testing.T) {
 	t.Parallel()
 	entry := func(number byte) []byte { return []byte{0, number, 0, 1} }
 	key := append(makePrefix(1, 1, indexBlobEntry), 1, 1, 0, 'k')
-	db := &DB{records: []leveldb.Record{
+	db := &DB{ctx: context.Background(), records: []leveldb.Record{
 		{Key: key, Value: entry(9), Seq: 20, State: leveldb.Live, FileType: leveldb.Log},
 		// A compacted table file has a higher number but holds older data.
 		{Key: append(append([]byte{}, key...), 1, 10, 0, 0, 0, 0, 0, 0), Value: entry(3), Seq: 10, State: leveldb.Live, FileType: leveldb.Ldb},
@@ -222,4 +224,79 @@ func TestBlobEntryWithHighestSequenceWins(t *testing.T) {
 	info, ok := db.blobInfo[blobKey{db: 1, store: 1, key: string([]byte{1, 1, 0, 'k'}), index: 0}]
 	require.True(t, ok)
 	assert.Equal(t, uint64(9), info.number)
+}
+
+func TestBlobFilesExcludeUnreferencedAndDeletedEntries(t *testing.T) {
+	t.Parallel()
+	entry := func(number byte) []byte { return []byte{0, number, 0, 1} }
+	key := func(name byte) []byte { return append(makePrefix(1, 1, indexBlobEntry), 1, 1, 0, name) }
+	db := &DB{ctx: context.Background(), records: []leveldb.Record{
+		{Key: key('a'), Value: entry(1), Seq: 1, State: leveldb.Live, FileType: leveldb.Log},
+		{Key: key('a'), Value: entry(2), Seq: 2, State: leveldb.Live, FileType: leveldb.Log},
+		{Key: key('b'), Value: entry(3), Seq: 3, State: leveldb.Live, FileType: leveldb.Log},
+		{Key: key('b'), Seq: 4, State: leveldb.Deleted, FileType: leveldb.Log},
+	}}
+	assert.Equal(t, []string{filepath.Join("1", "00", "2")}, db.BlobFiles())
+}
+
+func TestReadBlobRejectsOversizedFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := blobPath(dir, 1, 1)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	file, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, file.Truncate(leveldb.MaxDecodedSize+1))
+	require.NoError(t, file.Close())
+	key := []byte("key")
+	db := &DB{ctx: context.Background(), blobDir: dir, blobInfo: map[blobKey]blobInfo{
+		{db: 1, store: 1, key: string(key), index: 0}: {number: 1},
+	}}
+
+	_, err = db.readBlob(1, 1, key, 0)
+
+	require.ErrorIs(t, err, ErrBadValue)
+	assert.Contains(t, err.Error(), "exceeds")
+}
+
+func TestRecordsStopWhenCanceled(t *testing.T) {
+	t.Parallel()
+	fixture := filepath.Join("testdata", "fixture")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	db, err := Open(ctx, filepath.Join(fixture, "leveldb"), filepath.Join(fixture, "blob"), slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	cancel()
+	count, bad := 0, 0
+	for range db.Records(1, 1, func(error) { bad++ }) {
+		count++
+	}
+	assert.Zero(t, count)
+	assert.Zero(t, bad, "cancellation is not recorded as damaged data")
+}
+
+func TestBlobLengthMustMatchItsReference(t *testing.T) {
+	t.Parallel()
+	data := idbtest.Envelope("value")
+	dir := t.TempDir()
+	file := blobPath(dir, 1, 1)
+	require.NoError(t, os.MkdirAll(filepath.Dir(file), 0o700))
+	require.NoError(t, os.WriteFile(file, data, 0o600))
+	key := []byte("key")
+	db := &DB{ctx: context.Background(), blobDir: dir, blobInfo: map[blobKey]blobInfo{
+		{db: 1, store: 1, key: string(key), index: 0}: {number: 1},
+	}}
+	for _, declared := range []int{len(data) - 1, len(data), len(data) + 1} {
+		ref := binary.AppendUvarint([]byte{0xff, blinkWrappedPseudoVer, blinkReplaceWithBlob}, uint64(declared))
+		ref = append(ref, 0)
+		value, err := db.decodeEnvelope(1, 1, key, ref, 0)
+		if declared == len(data) {
+			require.NoError(t, err)
+			assert.Equal(t, "value", value)
+		} else {
+			require.ErrorIs(t, err, ErrBadValue)
+			assert.Nil(t, value)
+			assert.Contains(t, err.Error(), "reference declares")
+		}
+	}
 }

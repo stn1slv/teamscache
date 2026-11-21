@@ -9,6 +9,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/stn1slv/teamscache/internal/leveldb"
 	"github.com/stn1slv/teamscache/internal/service"
 	"github.com/stn1slv/teamscache/internal/teams"
 )
@@ -16,7 +17,17 @@ import (
 // Result wraps a list, so that structured content is a JSON object as older
 // MCP clients expect.
 type Result[T any] struct {
-	Result []T `json:"result"`
+	Result          []T              `json:"result"`
+	SkippedRecords  int              `json:"skipped_records"`
+	DamagedSections []leveldb.Damage `json:"damaged_sections"`
+	Partial         bool             `json:"partial"`
+}
+
+func result[T any](snap *service.Snapshot, rows []T) Result[T] {
+	return Result[T]{
+		Result: rows, SkippedRecords: snap.Skipped, DamagedSections: snap.Damage,
+		Partial: snap.Skipped > 0 || len(snap.Damage) > 0,
+	}
 }
 
 type accountArg struct {
@@ -92,6 +103,14 @@ type server struct {
 	account string
 }
 
+func (s *server) messageResult(ctx context.Context, snap *service.Snapshot, msgs []teams.Message) (*mcp.CallToolResult, Result[service.MessageRow], error) {
+	rows, err := service.Rows(ctx, msgs, s.opts.MaxContent)
+	if err != nil {
+		return nil, Result[service.MessageRow]{}, err
+	}
+	return nil, result(snap, rows), nil
+}
+
 // scope returns the account filter of a tool call. A server bound to one
 // account always uses it and rejects requests for another account.
 func (s *server) scope(requested string) (string, error) {
@@ -141,11 +160,14 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			}
 			out := []service.Account{}
 			for _, a := range snap.Accounts {
+				if err := ctx.Err(); err != nil {
+					return nil, Result[service.Account]{}, err
+				}
 				if account == "" || a.Key == account {
 					out = append(out, a)
 				}
 			}
-			return nil, Result[service.Account]{Result: out}, nil
+			return nil, result(snap, out), ctx.Err()
 		})
 
 	mcp.AddTool(s, tool("list_conversations",
@@ -155,11 +177,17 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			if err != nil {
 				return nil, Result[teams.Conversation]{}, err
 			}
-			convs := snap.ListConversations(account, orDefault(in.Limit, 100))
+			convs, err := snap.ListConversations(ctx, account, orDefault(in.Limit, 100))
+			if err != nil {
+				return nil, Result[teams.Conversation]{}, err
+			}
 			for i := range convs {
+				if err := ctx.Err(); err != nil {
+					return nil, Result[teams.Conversation]{}, err
+				}
 				convs[i].LastMessage = service.Truncate(convs[i].LastMessage, opts.MaxContent)
 			}
-			return nil, Result[teams.Conversation]{Result: convs}, nil
+			return nil, result(snap, convs), ctx.Err()
 		})
 
 	mcp.AddTool(s, tool("read_conversation",
@@ -169,8 +197,11 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			if err != nil {
 				return nil, Result[service.MessageRow]{}, err
 			}
-			msgs := snap.ReadConversation(in.ConversationID, account, orDefault(in.Limit, 50))
-			return nil, Result[service.MessageRow]{Result: service.Rows(msgs, opts.MaxContent)}, nil
+			msgs, err := snap.ReadConversation(ctx, in.ConversationID, account, orDefault(in.Limit, 50))
+			if err != nil {
+				return nil, Result[service.MessageRow]{}, err
+			}
+			return srv.messageResult(ctx, snap, msgs)
 		})
 
 	mcp.AddTool(s, tool("search_messages",
@@ -184,8 +215,11 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			if err != nil {
 				return nil, Result[service.MessageRow]{}, err
 			}
-			msgs := snap.Search(in.Query, account, d, orDefault(in.Limit, 50), opts)
-			return nil, Result[service.MessageRow]{Result: service.Rows(msgs, opts.MaxContent)}, nil
+			msgs, err := snap.Search(ctx, in.Query, account, d, orDefault(in.Limit, 50), opts)
+			if err != nil {
+				return nil, Result[service.MessageRow]{}, err
+			}
+			return srv.messageResult(ctx, snap, msgs)
 		})
 
 	mcp.AddTool(s, tool("recent_messages",
@@ -199,8 +233,11 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			if err != nil {
 				return nil, Result[service.MessageRow]{}, err
 			}
-			msgs := snap.Recent(d, account, orDefault(in.Limit, 200), opts)
-			return nil, Result[service.MessageRow]{Result: service.Rows(msgs, opts.MaxContent)}, nil
+			msgs, err := snap.Recent(ctx, d, account, orDefault(in.Limit, 200), opts)
+			if err != nil {
+				return nil, Result[service.MessageRow]{}, err
+			}
+			return srv.messageResult(ctx, snap, msgs)
 		})
 
 	mcp.AddTool(s, tool("mentions",
@@ -214,8 +251,11 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			if err != nil {
 				return nil, Result[service.MentionRow]{}, err
 			}
-			rows := snap.MentionsQuery(d, orDefault(in.UnreadOnly, false), account, orDefault(in.Limit, 100), opts)
-			return nil, Result[service.MentionRow]{Result: rows}, nil
+			rows, err := snap.MentionsQuery(ctx, d, orDefault(in.UnreadOnly, false), account, orDefault(in.Limit, 100), opts)
+			if err != nil {
+				return nil, Result[service.MentionRow]{}, err
+			}
+			return nil, result(snap, rows), nil
 		})
 
 	mcp.AddTool(s, tool("unread_messages",
@@ -229,8 +269,11 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			if err != nil {
 				return nil, Result[service.MentionRow]{}, err
 			}
-			rows := snap.MentionsQuery(d, true, account, orDefault(in.Limit, 100), opts)
-			return nil, Result[service.MentionRow]{Result: rows}, nil
+			rows, err := snap.MentionsQuery(ctx, d, true, account, orDefault(in.Limit, 100), opts)
+			if err != nil {
+				return nil, Result[service.MentionRow]{}, err
+			}
+			return nil, result(snap, rows), nil
 		})
 
 	mcp.AddTool(s, tool("overview",
@@ -244,7 +287,11 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			if err != nil {
 				return nil, Result[service.OverviewRow]{}, err
 			}
-			return nil, Result[service.OverviewRow]{Result: snap.Overview(d, account, opts)}, nil
+			rows, err := snap.Overview(ctx, d, account, opts)
+			if err != nil {
+				return nil, Result[service.OverviewRow]{}, err
+			}
+			return nil, result(snap, rows), nil
 		})
 
 	return s

@@ -40,7 +40,7 @@ teamscache conversations                 # chats and channels
 teamscache read "19:abc@thread.v2"       # last messages of one conversation
 ```
 
-All commands print JSON to stdout and a short summary to stderr, for example `# 12 result(s), 0 record(s) skipped`. A skipped record is one that could not be decoded.
+All commands print JSON to stdout and a short summary to stderr, for example `# 12 result(s), 0 record(s) skipped, 0 damaged section(s)`. Skipped records could not be decoded. Damaged sections are unreadable file sections or missing referenced blob files, and are counted separately.
 
 | Flag | Commands | Meaning |
 |------|----------|---------|
@@ -86,12 +86,14 @@ The cache has no general read or unread marker. The read state of @-mentions is 
 
 The server parses the cache on the first tool call and keeps the result in memory. It parses again when the TTL ends or when Teams writes new data.
 
+Every tool response keeps its rows in `result` and includes `skipped_records`, `damaged_sections`, and `partial`. When `partial` is true, some cache data could not be read, so an empty result does not confirm that no matching messages exist.
+
 ## How it works
 
 The new Teams client (`com.microsoft.teams2` on macOS, the `MSTeams` package on Windows) is an Edge WebView2 app. It stores recent conversations in an IndexedDB database, which Chromium keeps in LevelDB with values in the V8 serialization format. `teamscache`:
 
 1. finds the LevelDB folder, or uses `--leveldb`,
-2. copies it to a temporary folder, because the running client locks the files, and removes the copy when it is done,
+2. copies its data files and referenced blob files to a temporary folder, because the running client locks the files, and removes the copy when it is done,
 3. reads the LevelDB files directly (tables and logs, including Snappy-compressed blocks), without a LevelDB engine,
 4. decodes the IndexedDB keys and the Blink and V8 values,
 5. maps the Teams schema: messages in `replychains`, chats in `conversations`, mentions in `mentions-metadata-items`, one database set per tenant and user.
@@ -112,6 +114,7 @@ make test     # unit tests with the race detector
 make lint     # golangci-lint and gofumpt
 make format   # format the code
 make build    # build bin/teamscache
+make upgrade-deps # update dependencies and pinned Go tools
 ```
 
 Tests use synthetic data only. The test fixtures and their generators are in `testdata` folders:

@@ -17,6 +17,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -28,6 +30,35 @@ import (
 
 // ErrCorrupt reports data that does not follow the LevelDB file formats.
 var ErrCorrupt = errors.New("corrupt leveldb data")
+
+// Damage describes a file section that could not be read.
+type Damage struct {
+	File   string `json:"file"`
+	Offset int64  `json:"offset"`
+	Length int64  `json:"length"`
+	Reason string `json:"reason"`
+}
+
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+func maskedCRC(data []byte) uint32 {
+	crc := crc32.Checksum(data, crcTable)
+	return (crc>>15 | crc<<17) + 0xa282ead8
+}
+
+// ContextReader stops reading when its context is canceled.
+type ContextReader struct {
+	Context context.Context
+	Reader  io.Reader
+}
+
+// Read checks cancellation before each read.
+func (r ContextReader) Read(p []byte) (int, error) {
+	if err := r.Context.Err(); err != nil {
+		return 0, err
+	}
+	return r.Reader.Read(p)
+}
 
 // KeyState is the state of a record: live (a put) or deleted (a tombstone).
 type KeyState int
@@ -89,10 +120,13 @@ type dataFile struct {
 // Damaged parts of a file are skipped with a warning, so one damaged file
 // does not hide the rest of the data.
 // It stops with the context's error when ctx is canceled.
-func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, error) {
+func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, []Damage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read leveldb directory: %w", err)
+		return nil, nil, fmt.Errorf("read leveldb directory: %w", err)
 	}
 	var files []dataFile
 	for _, e := range entries {
@@ -114,27 +148,49 @@ func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, er
 	sort.SliceStable(files, func(i, j int) bool { return files[i].number < files[j].number })
 
 	var records []Record
+	damage := []Damage{}
 	for _, f := range files {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		data, err := os.ReadFile(f.path)
+		data, err := readFile(ctx, f.path)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", f.path, err)
+			return nil, nil, fmt.Errorf("read %s: %w", f.path, err)
 		}
 		if f.isLog {
-			recs, damage := parseLog(data, f.path)
-			for _, d := range damage {
+			recs, sections, err := parseLog(ctx, data, f.path)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, d := range sections {
 				logger.Warn("skipped damaged log data", "file", f.path, "offset", d.offset, "length", d.length, "reason", d.reason)
+				damage = append(damage, Damage{File: filepath.Base(f.path), Offset: d.offset, Length: d.length, Reason: d.reason})
 			}
 			records = append(records, recs...)
 			continue
 		}
-		recs, err := parseTable(data, f.path)
+		recs, sections, err := parseTable(ctx, data, f.path)
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
 		if err != nil {
 			logger.Warn("skipped the unreadable part of a table file", "file", f.path, "records_read", len(recs), "error", err)
+			damage = append(damage, Damage{File: filepath.Base(f.path), Length: int64(len(data)), Reason: err.Error()})
 		}
+		for _, section := range sections {
+			logger.Warn("skipped damaged table data", "file", f.path, "offset", section.Offset, "length", section.Length, "reason", section.Reason)
+		}
+		damage = append(damage, sections...)
 		records = append(records, recs...)
 	}
-	return records, nil
+	return records, damage, nil
+}
+
+func readFile(ctx context.Context, path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }() // read-only, the read error is what matters
+	return io.ReadAll(ContextReader{Context: ctx, Reader: file})
 }
