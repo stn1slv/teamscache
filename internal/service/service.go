@@ -8,13 +8,12 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/stn1slv/teamscache/internal/leveldb"
 	"github.com/stn1slv/teamscache/internal/teams"
 )
 
@@ -25,6 +24,7 @@ type Snapshot struct {
 	Mentions      []teams.Mention
 	Accounts      []Account
 	Skipped       int
+	Damage        []leveldb.Damage
 }
 
 // Account is a (tenant, user) context with a best-effort organization label,
@@ -51,6 +51,10 @@ func Load(ctx context.Context, path string, logger *slog.Logger) (*Snapshot, err
 	}
 	snap.Accounts = accountsWithLabels(r.Accounts(), snap.Messages)
 	snap.Skipped = r.Skipped()
+	snap.Damage = r.Damage()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return snap, nil
 }
 
@@ -104,7 +108,7 @@ type Cache struct {
 	ttl    time.Duration
 	logger *slog.Logger
 
-	mu     sync.Mutex
+	gate   chan struct{}
 	snap   *Snapshot
 	sig    string
 	loaded time.Time
@@ -112,18 +116,28 @@ type Cache struct {
 
 // NewCache returns a cache for the LevelDB in path ("" to auto-discover).
 func NewCache(path string, ttl time.Duration, logger *slog.Logger) *Cache {
-	return &Cache{path: path, ttl: ttl, logger: logger}
+	return &Cache{path: path, ttl: ttl, logger: logger, gate: make(chan struct{}, 1)}
 }
 
 // Snapshot returns the parsed cache, parsing it when needed.
 func (c *Cache) Snapshot(ctx context.Context) (*Snapshot, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	select {
+	case c.gate <- struct{}{}:
+		defer func() { <-c.gate }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	path := c.path
 	if path == "" {
 		path = teams.FindCache()
 	}
 	sig := signature(path)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.snap != nil && time.Since(c.loaded) < c.ttl && sig == c.sig {
 		return c.snap, nil
 	}
@@ -222,22 +236,63 @@ func withTime[T any](item T, ts string) timed[T] {
 	return timed[T]{item: item, e: e, ok: ok}
 }
 
-// newestFirst sorts items by time, newest first, with undated items last.
-func newestFirst[T any](items []timed[T]) {
-	sort.SliceStable(items, func(i, j int) bool {
-		if items[i].ok != items[j].ok {
-			return items[i].ok
+// sortContext is a stable merge sort that can stop between comparisons.
+func sortContext[T any](ctx context.Context, items []T, less func(T, T) bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(items) < 2 {
+		return nil
+	}
+	source, target := items, make([]T, len(items))
+	for width := 1; width < len(items); width *= 2 {
+		for start := 0; start < len(items); start += 2 * width {
+			middle, end := min(start+width, len(items)), min(start+2*width, len(items))
+			left, right := start, middle
+			for at := start; at < end; at++ {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if left < middle && (right == end || !less(source[right], source[left])) {
+					target[at] = source[left]
+					left++
+				} else {
+					target[at] = source[right]
+					right++
+				}
+			}
 		}
-		return items[i].e > items[j].e
+		source, target = target, source
+	}
+	for start := 0; start < len(items); start += 1024 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := min(start+1024, len(items))
+		copy(items[start:end], source[start:end])
+	}
+	return ctx.Err()
+}
+
+// newestFirst sorts items by time, newest first, with undated items last.
+func newestFirst[T any](ctx context.Context, items []timed[T]) error {
+	return sortContext(ctx, items, func(a, b timed[T]) bool {
+		if a.ok != b.ok {
+			return a.ok
+		}
+		return a.e > b.e
 	})
 }
 
-func untimed[T any](items []timed[T]) []T {
+func untimed[T any](ctx context.Context, items []timed[T]) ([]T, error) {
 	out := make([]T, 0, len(items))
 	for _, t := range items {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		out = append(out, t.item)
 	}
-	return out
+	return out, ctx.Err()
 }
 
 // firstChars returns the first n characters of s.
@@ -267,9 +322,12 @@ func limited[T any](items []T, limit int) []T {
 
 // ListConversations returns chats and channels that have a title or a last
 // message.
-func (s *Snapshot) ListConversations(account string, limit int) []teams.Conversation {
+func (s *Snapshot) ListConversations(ctx context.Context, account string, limit int) ([]teams.Conversation, error) {
 	out := []teams.Conversation{}
 	for _, c := range s.Conversations {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if account != "" && c.Account != account {
 			continue
 		}
@@ -280,35 +338,46 @@ func (s *Snapshot) ListConversations(account string, limit int) []teams.Conversa
 			break
 		}
 	}
-	return out
+	return out, ctx.Err()
 }
 
 // ReadConversation returns the last limit messages of a conversation, oldest
 // first.
-func (s *Snapshot) ReadConversation(conversationID, account string, limit int) []teams.Message {
+func (s *Snapshot) ReadConversation(ctx context.Context, conversationID, account string, limit int) ([]teams.Message, error) {
 	var found []timed[teams.Message]
 	for _, m := range s.Messages {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if m.ConversationID == conversationID && (account == "" || m.Account == account) {
 			found = append(found, withTime(m, m.Timestamp))
 		}
 	}
 	// Oldest first; undated messages count as time 0 and come first.
-	sort.SliceStable(found, func(i, j int) bool { return found[i].e < found[j].e })
-	msgs := untimed(found)
+	if err := sortContext(ctx, found, func(a, b timed[teams.Message]) bool { return a.e < b.e }); err != nil {
+		return nil, err
+	}
+	msgs, err := untimed(ctx, found)
+	if err != nil {
+		return nil, err
+	}
 	if limit > 0 && len(msgs) > limit {
 		msgs = msgs[len(msgs)-limit:]
 	}
-	return msgs
+	return msgs, ctx.Err()
 }
 
 // Search returns messages whose content or sender contains query, ignoring
 // case, newest first. When days is above 0, only messages of the last days
 // days count.
-func (s *Snapshot) Search(query, account string, days, limit int, opts Options) []teams.Message {
+func (s *Snapshot) Search(ctx context.Context, query, account string, days, limit int, opts Options) ([]teams.Message, error) {
 	q := strings.ToLower(query)
 	cutoff := opts.cutoff(days)
 	var hits []timed[teams.Message]
 	for _, m := range s.Messages {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if account != "" && m.Account != account {
 			continue
 		}
@@ -320,16 +389,21 @@ func (s *Snapshot) Search(query, account string, days, limit int, opts Options) 
 			hits = append(hits, t)
 		}
 	}
-	newestFirst(hits)
-	return untimed(limited(hits, limit))
+	if err := newestFirst(ctx, hits); err != nil {
+		return nil, err
+	}
+	return untimed(ctx, limited(hits, limit))
 }
 
 // Recent returns the messages of the last days days, newest first. When days
 // is 0 or less, all messages count, and undated ones come last.
-func (s *Snapshot) Recent(days int, account string, limit int, opts Options) []teams.Message {
+func (s *Snapshot) Recent(ctx context.Context, days int, account string, limit int, opts Options) ([]teams.Message, error) {
 	cutoff := opts.cutoff(days)
 	var hits []timed[teams.Message]
 	for _, m := range s.Messages {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if account != "" && m.Account != account {
 			continue
 		}
@@ -339,8 +413,10 @@ func (s *Snapshot) Recent(days int, account string, limit int, opts Options) []t
 		}
 		hits = append(hits, t)
 	}
-	newestFirst(hits)
-	return untimed(limited(hits, limit))
+	if err := newestFirst(ctx, hits); err != nil {
+		return nil, err
+	}
+	return untimed(ctx, limited(hits, limit))
 }
 
 // MentionRow is an @-mention with the content of the message.
@@ -356,12 +432,15 @@ type MentionRow struct {
 
 type accountKey struct{ account, id string }
 
-func (s *Snapshot) titles() map[accountKey]string {
+func (s *Snapshot) titles(ctx context.Context) (map[accountKey]string, error) {
 	out := map[accountKey]string{}
 	for _, c := range s.Conversations {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		out[accountKey{c.Account, c.ID}] = c.Title
 	}
-	return out
+	return out, ctx.Err()
 }
 
 // messageIndex finds the newest version of a message.
@@ -370,9 +449,12 @@ type messageIndex struct {
 	byID           map[accountKey]teams.Message
 }
 
-func newestMessages(msgs []teams.Message) messageIndex {
+func newestMessages(ctx context.Context, msgs []teams.Message) (messageIndex, error) {
 	idx := messageIndex{byConversation: map[[3]string]teams.Message{}, byID: map[accountKey]teams.Message{}}
 	for _, m := range msgs {
+		if err := ctx.Err(); err != nil {
+			return messageIndex{}, err
+		}
 		k3 := [3]string{m.Account, m.ConversationID, m.MessageID}
 		if old, ok := idx.byConversation[k3]; !ok || m.Seq >= old.Seq {
 			idx.byConversation[k3] = m
@@ -382,7 +464,7 @@ func newestMessages(msgs []teams.Message) messageIndex {
 			idx.byID[k] = m
 		}
 	}
-	return idx
+	return idx, ctx.Err()
 }
 
 // find returns the message in the conversation, or else a message with the
@@ -397,12 +479,21 @@ func (idx messageIndex) find(account, conversationID, messageID string) (teams.M
 
 // MentionsQuery returns @-mentions of the user, newest first. When days is
 // above 0, only mentions of the last days days count.
-func (s *Snapshot) MentionsQuery(days int, unreadOnly bool, account string, limit int, opts Options) []MentionRow {
-	content := newestMessages(s.Messages)
-	titles := s.titles()
+func (s *Snapshot) MentionsQuery(ctx context.Context, days int, unreadOnly bool, account string, limit int, opts Options) ([]MentionRow, error) {
+	content, err := newestMessages(ctx, s.Messages)
+	if err != nil {
+		return nil, err
+	}
+	titles, err := s.titles(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cutoff := opts.cutoff(days)
 	var rows []timed[MentionRow]
 	for _, mt := range s.Mentions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if account != "" && mt.Account != account {
 			continue
 		}
@@ -426,8 +517,10 @@ func (s *Snapshot) MentionsQuery(days int, unreadOnly bool, account string, limi
 		}
 		rows = append(rows, timed[MentionRow]{item: row, e: e, ok: ok})
 	}
-	newestFirst(rows)
-	return untimed(limited(rows, limit))
+	if err := newestFirst(ctx, rows); err != nil {
+		return nil, err
+	}
+	return untimed(ctx, limited(rows, limit))
 }
 
 // OverviewRow is the recent activity of one conversation.
@@ -444,9 +537,12 @@ type OverviewRow struct {
 
 // Overview groups the messages of the last days days by conversation, newest
 // conversation first. When days is 0 or less, all messages count.
-func (s *Snapshot) Overview(days int, account string, opts Options) []OverviewRow {
+func (s *Snapshot) Overview(ctx context.Context, days int, account string, opts Options) ([]OverviewRow, error) {
 	const maxSenders = 8
-	titles := s.titles()
+	titles, err := s.titles(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cutoff := opts.cutoff(days)
 	type group struct {
 		key     accountKey
@@ -459,6 +555,9 @@ func (s *Snapshot) Overview(days int, account string, opts Options) []OverviewRo
 	var groups []*group
 	byKey := map[accountKey]*group{}
 	for i := range s.Messages {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		m := &s.Messages[i]
 		if account != "" && m.Account != account {
 			continue
@@ -489,11 +588,19 @@ func (s *Snapshot) Overview(days int, account string, opts Options) []OverviewRo
 	}
 	rows := make([]timed[OverviewRow], 0, len(groups))
 	for _, g := range groups {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		senders := make([]string, 0, len(g.senders))
 		for name := range g.senders {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			senders = append(senders, name)
 		}
-		sort.Strings(senders)
+		if err := sortContext(ctx, senders, func(a, b string) bool { return a < b }); err != nil {
+			return nil, err
+		}
 		row := OverviewRow{
 			Conversation: titles[g.key], ConversationID: g.key.id, Count: g.count,
 			Senders: limited(senders, maxSenders), Account: g.key.account,
@@ -506,8 +613,10 @@ func (s *Snapshot) Overview(days int, account string, opts Options) []OverviewRo
 		}
 		rows = append(rows, timed[OverviewRow]{item: row, e: g.lastE, ok: g.lastOK})
 	}
-	newestFirst(rows)
-	return untimed(rows)
+	if err := newestFirst(ctx, rows); err != nil {
+		return nil, err
+	}
+	return untimed(ctx, rows)
 }
 
 // MessageRow is a message in the compact form the MCP tools return.
@@ -521,13 +630,16 @@ type MessageRow struct {
 
 // Rows converts messages to compact rows with content cut to maxContent
 // characters.
-func Rows(msgs []teams.Message, maxContent int) []MessageRow {
+func Rows(ctx context.Context, msgs []teams.Message, maxContent int) ([]MessageRow, error) {
 	out := make([]MessageRow, 0, len(msgs))
 	for _, m := range msgs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		out = append(out, MessageRow{
 			Sender: m.Sender, Timestamp: m.Timestamp, Content: Truncate(m.Content, maxContent),
 			ConversationID: m.ConversationID, Account: m.Account,
 		})
 	}
-	return out
+	return out, ctx.Err()
 }

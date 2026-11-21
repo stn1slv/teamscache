@@ -1,10 +1,14 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BIN := bin/teamscache
 
-.PHONY: setup test lint format build run clean
+.PHONY: setup test lint format build run clean upgrade-deps
 
 setup: ## Download dependencies and tools
 	go mod download
+
+upgrade-deps: ## Update dependencies and pinned tools
+	go get -u ./... tool
+	go mod tidy
 
 test: ## Run the unit tests
 	go test -race ./...

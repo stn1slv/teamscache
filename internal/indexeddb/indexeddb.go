@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"unicode/utf16"
 
@@ -42,6 +43,8 @@ type DatabaseID struct {
 
 // DB is an IndexedDB LevelDB, read into memory.
 type DB struct {
+	ctx       context.Context
+	damage    []leveldb.Damage
 	records   []leveldb.Record
 	blobDir   string
 	databases []DatabaseID
@@ -55,13 +58,38 @@ type DB struct {
 // Open reads all records of the LevelDB in dir. blobDir is the folder that
 // holds values too large for LevelDB; it may be empty.
 func Open(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, error) {
-	records, err := leveldb.ReadDir(ctx, dir, logger)
+	records, damage, err := leveldb.ReadDir(ctx, dir, logger)
 	if err != nil {
 		return nil, err
 	}
-	db := &DB{records: records, blobDir: blobDir}
+	db := &DB{ctx: ctx, records: records, blobDir: blobDir, damage: damage}
 	db.readMetadata()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return db, nil
+}
+
+// Damage returns the file sections skipped while reading LevelDB.
+func (db *DB) Damage() []leveldb.Damage {
+	return db.damage
+}
+
+// BlobFiles lists referenced blob files relative to the blob directory.
+func (db *DB) BlobFiles() []string {
+	if db.blobInfo == nil {
+		db.loadBlobInfo()
+	}
+	seen := map[string]bool{}
+	for key, info := range db.blobInfo {
+		seen[blobPath("", key.db, info.number)] = true
+	}
+	files := make([]string, 0, len(seen))
+	for path := range seen {
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	return files
 }
 
 // Databases returns the databases in the order ccl lists them.
@@ -77,6 +105,9 @@ func (db *DB) newestLive(keyOf func(r *leveldb.Record) (string, bool)) ([]string
 	var order []string
 	found := map[string]*leveldb.Record{}
 	for i := len(db.records) - 1; i >= 0; i-- {
+		if db.ctx.Err() != nil {
+			break
+		}
 		r := &db.records[i]
 		k, ok := keyOf(r)
 		if !ok {

@@ -164,11 +164,11 @@ var (
 	breakRE = regexp.MustCompile(`(?i)<br\s*/?>|</(?:p|div|li|tr|h[1-6]|blockquote|pre)\s*>`)
 )
 
-// text returns plain text from an HTML or plain message body.
-func text(v any) string {
+// plainText returns a plain field without interpreting markup or entities.
+func plainText(v any) string {
 	var s string
 	switch x := v.(type) {
-	case nil:
+	case nil, v8.Undefined:
 		return ""
 	case string:
 		s = x
@@ -177,10 +177,27 @@ func text(v any) string {
 	default:
 		s = valueString(v)
 	}
+	return stripSpace(s)
+}
+
+// text converts an HTML field to plain text.
+func text(v any) string {
+	s := plainText(v)
 	// Remove tags before decoding entities, so that escaped text such as
 	// "&lt;tag&gt;" stays in the result.
 	s = tagRE.ReplaceAllString(breakRE.ReplaceAllString(s, "\n"), "")
 	return stripSpace(html.UnescapeString(s))
+}
+
+// messageText preserves plain messages. Missing types keep the legacy HTML
+// conversion because older cache records may omit messageType.
+func messageText(message *v8.Object) string {
+	kind := strings.ToLower(plainText(get(message, "messageType")))
+	content := get(message, "content")
+	if kind == "text" {
+		return plainText(content)
+	}
+	return text(content)
 }
 
 // stripSpace removes leading and trailing whitespace: Unicode spaces plus

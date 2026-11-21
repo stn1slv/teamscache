@@ -1,8 +1,10 @@
 package leveldb
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"path/filepath"
 
 	"github.com/golang/snappy"
 )
@@ -10,7 +12,7 @@ import (
 const (
 	tableFooterSize  = 48
 	tableMagic       = 0xdb4775248b80fb57
-	blockTrailerSize = 5 // 1 byte compression type, 4 bytes CRC (not checked)
+	blockTrailerSize = 5 // 1 byte compression type, 4 bytes masked CRC32C
 )
 
 // MaxDecodedSize is the largest Snappy output this module accepts. Larger
@@ -46,44 +48,56 @@ func readBlockHandle(data []byte) (blockHandle, int, error) {
 	return blockHandle{offset: offset, length: length}, n1 + n2, nil
 }
 
-// parseTable returns the records of a table file. On a format error it returns
-// the records read so far together with the error.
-func parseTable(data []byte, path string) ([]Record, error) {
+// parseTable skips damaged data blocks and continues through the index.
+// An unreadable footer or index is a file-level error.
+func parseTable(ctx context.Context, data []byte, path string) ([]Record, []Damage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if len(data) < tableFooterSize {
-		return nil, fmt.Errorf("%w: file shorter than the table footer", ErrCorrupt)
+		return nil, nil, fmt.Errorf("%w: file shorter than the table footer", ErrCorrupt)
 	}
 	footer := data[len(data)-tableFooterSize:]
 	if binary.LittleEndian.Uint64(footer[40:]) != tableMagic {
-		return nil, fmt.Errorf("%w: bad table magic number", ErrCorrupt)
+		return nil, nil, fmt.Errorf("%w: bad table magic number", ErrCorrupt)
 	}
 	_, n, err := readBlockHandle(footer) // meta-index handle, not used
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	indexHandle, _, err := readBlockHandle(footer[n:])
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	index, _, err := readBlock(data, indexHandle)
 	if err != nil {
-		return nil, fmt.Errorf("index block: %w", err)
+		return nil, []Damage{blockDamage(data, path, indexHandle, err)}, nil
 	}
-	indexEntries, err := blockEntries(index)
+	indexEntries, err := blockEntries(ctx, index)
+	damage := []Damage{}
 	if err != nil {
-		return nil, fmt.Errorf("index block: %w", err)
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		damage = append(damage, blockDamage(data, path, indexHandle, err))
 	}
 
 	var records []Record
 	for _, ie := range indexEntries {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		handle, _, err := readBlockHandle(ie.value)
 		if err != nil {
-			return records, err
+			damage = append(damage, blockDamage(data, path, indexHandle, err))
+			continue
 		}
 		block, compressed, err := readBlock(data, handle)
 		if err != nil {
-			return records, err
+			damage = append(damage, blockDamage(data, path, handle, err))
+			continue
 		}
-		entries, err := blockEntries(block)
+		entries, err := blockEntries(ctx, block)
 		for _, e := range entries {
 			offset := int64(handle.offset)
 			if !compressed {
@@ -92,10 +106,22 @@ func parseTable(data []byte, path string) ([]Record, error) {
 			records = append(records, tableRecord(e.key, e.value, path, offset))
 		}
 		if err != nil {
-			return records, err
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			damage = append(damage, blockDamage(data, path, handle, err))
 		}
 	}
-	return records, nil
+	return records, damage, nil
+}
+
+func blockDamage(data []byte, path string, handle blockHandle, err error) Damage {
+	offset := min(handle.offset, uint64(len(data)))
+	length := min(handle.length, uint64(len(data))-offset)
+	length += min(uint64(blockTrailerSize), uint64(len(data))-offset-length)
+	return Damage{
+		File: filepath.Base(path), Offset: int64(offset), Length: int64(length), Reason: err.Error(),
+	}
 }
 
 func tableRecord(key, value []byte, path string, offset int64) Record {
@@ -120,8 +146,15 @@ func readBlock(data []byte, h blockHandle) (block []byte, compressed bool, err e
 		return nil, false, fmt.Errorf("%w: block at offset %d runs past the end of the file", ErrCorrupt, h.offset)
 	}
 	raw := data[h.offset : h.offset+h.length]
-	if data[h.offset+h.length] == 0 {
+	end := h.offset + h.length
+	if maskedCRC(data[h.offset:end+1]) != binary.LittleEndian.Uint32(data[end+1:end+5]) {
+		return nil, false, fmt.Errorf("%w: checksum mismatch at block offset %d", ErrCorrupt, h.offset)
+	}
+	if data[end] == 0 {
 		return raw, false, nil
+	}
+	if data[end] != 1 {
+		return nil, false, fmt.Errorf("%w: unknown compression type %d", ErrCorrupt, data[end])
 	}
 	decoded, err := DecodeSnappy(raw)
 	if err != nil {
@@ -137,7 +170,7 @@ type blockEntry struct {
 }
 
 // blockEntries decodes the prefix-compressed entries of a table block.
-func blockEntries(block []byte) ([]blockEntry, error) {
+func blockEntries(ctx context.Context, block []byte) ([]blockEntry, error) {
 	if len(block) < 4 {
 		return nil, fmt.Errorf("%w: block too short", ErrCorrupt)
 	}
@@ -158,6 +191,9 @@ func blockEntries(block []byte) ([]blockEntry, error) {
 	var entries []blockEntry
 	var key []byte
 	for pos < restartOffset {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		start := pos
 		var vals [3]uint64
 		for i := range vals {

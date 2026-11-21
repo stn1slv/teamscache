@@ -33,6 +33,24 @@ import (
 // ErrCacheNotFound reports that no Teams cache folder was found.
 var ErrCacheNotFound = errors.New("teams cache not found")
 
+// ErrBlobTooLarge reports a blob that exceeds the decoding size limit.
+var ErrBlobTooLarge = errors.New("blob exceeds the size limit")
+
+type sourceReadError struct{ err error }
+
+func (e *sourceReadError) Error() string { return "read cache source: " + e.err.Error() }
+func (e *sourceReadError) Unwrap() error { return e.err }
+
+type sourceReader struct{ reader io.Reader }
+
+func (r sourceReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, &sourceReadError{err: err}
+	}
+	return n, err
+}
+
 // Account is one (tenant, user) context in the cache.
 type Account struct {
 	TenantID string
@@ -83,6 +101,7 @@ type Reader struct {
 	db      *indexeddb.DB
 	tmp     string
 	skipped int
+	damage  []leveldb.Damage
 	logger  *slog.Logger
 }
 
@@ -91,6 +110,9 @@ type Reader struct {
 // running Teams client holds a lock on it. Call Close to remove the copy.
 // When ctx is canceled, Open removes the copy and returns the context's error.
 func Open(ctx context.Context, path string, logger *slog.Logger) (*Reader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if path == "" {
 		path = FindCache()
 	}
@@ -109,8 +131,39 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*Reader, error
 		r.Close()
 		return nil, err
 	}
-	r.db, err = indexeddb.Open(ctx, copyDir, blobDirFor(path), logger)
+	copyBlobDir := filepath.Join(tmp, "blobs")
+	r.db, err = indexeddb.Open(ctx, copyDir, copyBlobDir, logger)
 	if err != nil {
+		r.Close()
+		return nil, err
+	}
+	r.damage = r.db.Damage()
+	for _, file := range r.db.BlobFiles() {
+		dst := filepath.Join(copyBlobDir, file)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			r.Close()
+			return nil, fmt.Errorf("create blob copy folder: %w", err)
+		}
+		if err := copyFile(ctx, filepath.Join(blobDirFor(path), file), dst, leveldb.MaxDecodedSize); err != nil {
+			if ctx.Err() != nil {
+				r.Close()
+				return nil, ctx.Err()
+			}
+			var sourceErr *sourceReadError
+			if errors.As(err, &sourceErr) || errors.Is(err, ErrBlobTooLarge) {
+				reason := err.Error()
+				if errors.Is(err, fs.ErrNotExist) {
+					reason = "referenced blob is missing"
+				}
+				logger.Warn("could not copy a referenced blob", "file", file, "error", err)
+				r.damage = append(r.damage, leveldb.Damage{File: file, Reason: reason})
+				continue
+			}
+			r.Close()
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
 		r.Close()
 		return nil, err
 	}
@@ -129,6 +182,9 @@ func (r *Reader) Close() {
 
 // Skipped is the number of records that could not be decoded.
 func (r *Reader) Skipped() int { return r.skipped }
+
+// Damage returns the file sections or blob files missing from the snapshot.
+func (r *Reader) Damage() []leveldb.Damage { return r.damage }
 
 // copyAttempts is how many times the copy is tried while Teams changes the
 // set of files, for example during a compaction.
@@ -168,7 +224,7 @@ func copyOnce(ctx context.Context, src, dst string) (stable bool, err error) {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		err := copyFile(filepath.Join(src, name), filepath.Join(dst, name))
+		err := copyFile(ctx, filepath.Join(src, name), filepath.Join(dst, name), 0)
 		if errors.Is(err, fs.ErrNotExist) {
 			stable = false
 			continue
@@ -199,18 +255,51 @@ func dataFiles(dir string) ([]string, error) {
 	return names, nil
 }
 
-func copyFile(src, dst string) error {
+// copyFile copies a file. A positive limit caps the bytes written, including
+// when the source grows during copying. Source failures remove incomplete copies.
+func copyFile(ctx context.Context, src, dst string, limit int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	in, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("copy cache file: %w", err)
+		return &sourceReadError{err: err}
 	}
 	defer func() { _ = in.Close() }() // read-only, a close error changes nothing
+	if limit > 0 {
+		info, err := in.Stat()
+		if err != nil {
+			return &sourceReadError{err: err}
+		}
+		if info.Size() > limit {
+			return fmt.Errorf("%w: maximum %d bytes", ErrBlobTooLarge, limit)
+		}
+	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("copy cache file: %w", err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	reader := leveldb.ContextReader{Context: ctx, Reader: sourceReader{reader: in}}
+	var copied int64
+	if limit > 0 {
+		copied, err = io.Copy(out, io.LimitReader(reader, limit))
+		if err == nil && copied == limit {
+			var extra [1]byte
+			n, readErr := reader.Read(extra[:])
+			if n > 0 {
+				err = fmt.Errorf("%w: maximum %d bytes", ErrBlobTooLarge, limit)
+			} else if readErr != nil && !errors.Is(readErr, io.EOF) {
+				err = readErr
+			}
+		}
+	} else {
+		_, err = io.Copy(out, reader)
+	}
+	if err != nil {
 		_ = out.Close() // the copy error is the one to report
+		if removeErr := os.Remove(dst); removeErr != nil {
+			return fmt.Errorf("remove incomplete copy: %w", removeErr)
+		}
 		return fmt.Errorf("copy cache file: %w", err)
 	}
 	if err := out.Close(); err != nil {
@@ -344,7 +433,7 @@ func messages(stores storeFunc, account string) []Message {
 				if !ok {
 					continue
 				}
-				content := text(get(msg, "content"))
+				content := messageText(msg)
 				if content == "" {
 					continue
 				}
@@ -379,7 +468,7 @@ func conversations(stores storeFunc, account string) []Conversation {
 			last, _ := get(v, "lastMessage").(*v8.Object)
 			lastText := ""
 			if last != nil && last.Len() > 0 {
-				lastText = text(get(last, "content"))
+				lastText = messageText(last)
 			}
 			out = append(out, Conversation{
 				Account:         acc.Key(),

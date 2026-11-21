@@ -114,19 +114,22 @@ func validate(cmd *cobra.Command) error {
 	return nil
 }
 
-func run[T any](g *globals, query func(*service.Snapshot) []T) error {
+func run[T any](g *globals, query func(*service.Snapshot) ([]T, error)) error {
 	snap, err := service.Load(g.ctx, g.leveldb, g.logger())
 	if err != nil {
 		return err
 	}
-	out := query(snap)
+	out, err := query(snap)
+	if err != nil {
+		return err
+	}
 	enc := json.NewEncoder(g.stdout)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(out); err != nil {
 		return fmt.Errorf("write output: %w", err)
 	}
-	if _, err := fmt.Fprintf(g.stderr, "# %d result(s), %d record(s) skipped\n", len(out), snap.Skipped); err != nil {
+	if _, err := fmt.Fprintf(g.stderr, "# %d result(s), %d record(s) skipped, %d damaged section(s)\n", len(out), snap.Skipped, len(snap.Damage)); err != nil {
 		return fmt.Errorf("write summary: %w", err)
 	}
 	return nil
@@ -140,14 +143,17 @@ func accountsCommand(g *globals) *cobra.Command {
 		Short: "List the tenant and user contexts in the cache",
 		Args:  cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
-			return run(g, func(s *service.Snapshot) []service.Account {
+			return run(g, func(s *service.Snapshot) ([]service.Account, error) {
 				out := []service.Account{}
 				for _, a := range s.Accounts {
+					if err := g.ctx.Err(); err != nil {
+						return nil, err
+					}
 					if g.account == "" || a.Key == g.account {
 						out = append(out, a)
 					}
 				}
-				return out
+				return out, g.ctx.Err()
 			})
 		},
 	}
@@ -160,7 +166,9 @@ func conversationsCommand(g *globals) *cobra.Command {
 		Short: "List chats and channels",
 		Args:  cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
-			return run(g, func(s *service.Snapshot) []teams.Conversation { return s.ListConversations(g.account, limit) })
+			return run(g, func(s *service.Snapshot) ([]teams.Conversation, error) {
+				return s.ListConversations(g.ctx, g.account, limit)
+			})
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 50, limitHelp)
@@ -174,8 +182,8 @@ func searchCommand(g *globals) *cobra.Command {
 		Short: "Find messages whose content or sender contains QUERY, ignoring case",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return run(g, func(s *service.Snapshot) []teams.Message {
-				return s.Search(args[0], g.account, days, limit, g.options())
+			return run(g, func(s *service.Snapshot) ([]teams.Message, error) {
+				return s.Search(g.ctx, args[0], g.account, days, limit, g.options())
 			})
 		},
 	}
@@ -191,7 +199,9 @@ func readCommand(g *globals) *cobra.Command {
 		Short: "Show the most recent messages of a conversation, oldest first",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return run(g, func(s *service.Snapshot) []teams.Message { return s.ReadConversation(args[0], g.account, limit) })
+			return run(g, func(s *service.Snapshot) ([]teams.Message, error) {
+				return s.ReadConversation(g.ctx, args[0], g.account, limit)
+			})
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 50, limitHelp)
@@ -205,7 +215,9 @@ func recentCommand(g *globals) *cobra.Command {
 		Short: "Show messages of the last days, newest first",
 		Args:  cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
-			return run(g, func(s *service.Snapshot) []teams.Message { return s.Recent(days, g.account, limit, g.options()) })
+			return run(g, func(s *service.Snapshot) ([]teams.Message, error) {
+				return s.Recent(g.ctx, days, g.account, limit, g.options())
+			})
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 200, limitHelp)
@@ -223,8 +235,8 @@ func mentionsCommand(g *globals) *cobra.Command {
 			"The read state of mentions is the only read state the local cache keeps.",
 		Args: cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
-			return run(g, func(s *service.Snapshot) []service.MentionRow {
-				return s.MentionsQuery(days, unread, g.account, limit, g.options())
+			return run(g, func(s *service.Snapshot) ([]service.MentionRow, error) {
+				return s.MentionsQuery(g.ctx, days, unread, g.account, limit, g.options())
 			})
 		},
 	}
@@ -241,7 +253,9 @@ func overviewCommand(g *globals) *cobra.Command {
 		Short: "Show recent activity grouped by conversation, newest first",
 		Args:  cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
-			return run(g, func(s *service.Snapshot) []service.OverviewRow { return s.Overview(days, g.account, g.options()) })
+			return run(g, func(s *service.Snapshot) ([]service.OverviewRow, error) {
+				return s.Overview(g.ctx, days, g.account, g.options())
+			})
 		},
 	}
 	cmd.Flags().IntVar(&days, "days", 7, "number of days, 0 for all")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -48,6 +49,9 @@ func (db *DB) Records(dbNumber, storeID uint64, onBad func(error)) iter.Seq[Reco
 	prefix := makePrefix(dbNumber, storeID, indexObjectStoreData)
 	return func(yield func(Record) bool) {
 		for i := range db.records {
+			if db.ctx.Err() != nil {
+				return
+			}
 			r := &db.records[i]
 			userKey := r.UserKey()
 			if !bytes.HasPrefix(userKey, prefix) {
@@ -62,6 +66,9 @@ func (db *DB) Records(dbNumber, storeID uint64, onBad func(error)) iter.Seq[Reco
 			if len(r.Value) > 0 {
 				rec.Value, err = db.decodeValue(dbNumber, storeID, rec.Key, r.Value)
 				if err != nil {
+					if db.ctx.Err() != nil {
+						return
+					}
 					rec.Err = fmt.Errorf("record in %s at offset %d: %w", filepath.Base(r.File), r.Offset, err)
 					onBad(rec.Err)
 				}
@@ -83,6 +90,9 @@ func (db *DB) decodeValue(dbNumber, storeID uint64, key, value []byte) (any, err
 }
 
 func (db *DB) decodeEnvelope(dbNumber, storeID uint64, key, buf []byte, depth int) (any, error) {
+	if err := db.ctx.Err(); err != nil {
+		return nil, err
+	}
 	if depth > maxEnvelopeDepth {
 		return nil, fmt.Errorf("%w: too many nested envelopes", ErrBadValue)
 	}
@@ -101,14 +111,20 @@ func (db *DB) decodeEnvelope(dbNumber, storeID uint64, key, buf []byte, depth in
 		}
 		switch buf[pos] {
 		case blinkReplaceWithBlob:
-			_, n1 := leveldb.Uvarint(buf[pos+1:], 10) // size
+			size, n1 := leveldb.Uvarint(buf[pos+1:], 10)
 			index, n2 := leveldb.Uvarint(buf[pos+1+n1:], 10)
 			if n1 == 0 || n2 == 0 {
 				return nil, fmt.Errorf("%w: bad blob reference", ErrBadValue)
 			}
+			if size > leveldb.MaxDecodedSize {
+				return nil, fmt.Errorf("%w: blob declares %d bytes", ErrBadValue, size)
+			}
 			blob, err := db.readBlob(dbNumber, storeID, key, index)
 			if err != nil {
 				return nil, err
+			}
+			if uint64(len(blob)) != size {
+				return nil, fmt.Errorf("%w: blob has %d bytes, reference declares %d", ErrBadValue, len(blob), size)
 			}
 			return db.decodeEnvelope(dbNumber, storeID, key, blob, depth+1)
 		case blinkCompressedSnappy:
@@ -128,7 +144,7 @@ func (db *DB) decodeEnvelope(dbNumber, storeID uint64, key, buf []byte, depth in
 		}
 		pos += blinkTrailerSize
 	}
-	value, err := v8.Deserialize(buf[pos:], v8.ReadBlinkHostObject)
+	value, err := v8.Deserialize(db.ctx, buf[pos:], v8.ReadBlinkHostObject)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrBadValue, err)
 	}
@@ -205,9 +221,24 @@ func (db *DB) readBlob(dbNumber, storeID uint64, key []byte, index uint64) ([]by
 	if db.blobDir == "" {
 		return nil, fmt.Errorf("%w: value is stored in a blob file, but there is no blob folder", ErrBadValue)
 	}
-	data, err := os.ReadFile(blobPath(db.blobDir, dbNumber, info.number))
+	file, err := os.Open(blobPath(db.blobDir, dbNumber, info.number))
 	if err != nil {
 		return nil, fmt.Errorf("%w: read blob file: %w", ErrBadValue, err)
+	}
+	defer func() { _ = file.Close() }() // read-only, the read error is what matters
+	infoOnDisk, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("%w: stat blob file: %w", ErrBadValue, err)
+	}
+	if infoOnDisk.Size() > leveldb.MaxDecodedSize {
+		return nil, fmt.Errorf("%w: blob file exceeds %d bytes", ErrBadValue, leveldb.MaxDecodedSize)
+	}
+	data, err := io.ReadAll(io.LimitReader(leveldb.ContextReader{Context: db.ctx, Reader: file}, leveldb.MaxDecodedSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: read blob file: %w", ErrBadValue, err)
+	}
+	if len(data) > leveldb.MaxDecodedSize {
+		return nil, fmt.Errorf("%w: blob file exceeds %d bytes", ErrBadValue, leveldb.MaxDecodedSize)
 	}
 	return data, nil
 }
@@ -230,6 +261,9 @@ func (db *DB) loadBlobInfo() {
 	newest := map[[3]string]entryList{}
 	ids := map[[3]string][2]uint64{}
 	for i := range db.records {
+		if db.ctx.Err() != nil {
+			return
+		}
 		r := &db.records[i]
 		userKey := r.UserKey()
 		dbID, storeID, indexID, n, ok := readPrefix(userKey)

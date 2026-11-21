@@ -39,14 +39,17 @@ func TestTitledRowsLeadToReadConversation(t *testing.T) {
 		Mentions:      []teams.Mention{{Account: "a", ConversationID: "c", MessageID: "m", Timestamp: ms(0)}},
 	}
 
-	overview := snap.Overview(7, "", opts())
-	mentions := snap.MentionsQuery(0, false, "", 100, opts())
+	overview, err := snap.Overview(context.Background(), 7, "", opts())
+	require.NoError(t, err)
+	mentions, err := snap.MentionsQuery(context.Background(), 0, false, "", 100, opts())
+	require.NoError(t, err)
 
 	require.Len(t, overview, 1)
 	require.Len(t, mentions, 1)
 	assert.Equal(t, "Ann Lee", overview[0].Conversation)
 	assert.Equal(t, "Ann Lee", mentions[0].Conversation)
-	got := snap.ReadConversation(overview[0].ConversationID, "", 50)
+	got, err := snap.ReadConversation(context.Background(), overview[0].ConversationID, "", 50)
+	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "hi", got[0].Content)
 }
@@ -74,51 +77,73 @@ func TestQueries(t *testing.T) {
 
 	t.Run("search ignores case and filters by days", func(t *testing.T) {
 		t.Parallel()
-		assert.Len(t, snap.Search("BUDGET", "", 0, 0, opts()), 2)
-		assert.Len(t, snap.Search("budget", "", 2, 0, opts()), 1)
-		assert.Len(t, snap.Search("budget", "", 0, 1, opts()), 1)
-		assert.Len(t, snap.Search("org", "", 0, 0, opts()), 1, "the sender is searched too")
+		for _, tc := range []struct {
+			query              string
+			days, limit, count int
+		}{{"BUDGET", 0, 0, 2}, {"budget", 2, 0, 1}, {"budget", 0, 1, 1}, {"org", 0, 0, 1}} {
+			got, err := snap.Search(context.Background(), tc.query, "", tc.days, tc.limit, opts())
+			require.NoError(t, err)
+			assert.Len(t, got, tc.count, tc.query)
+		}
 	})
 	t.Run("recent is newest first and skips messages without time", func(t *testing.T) {
 		t.Parallel()
-		got := snap.Recent(7, "", 0, opts())
+		got, err := snap.Recent(context.Background(), 7, "", 0, opts())
+		require.NoError(t, err)
 		require.Len(t, got, 3)
 		assert.Equal(t, []string{"4", "1", "2"}, []string{got[0].MessageID, got[1].MessageID, got[2].MessageID})
-		assert.Len(t, snap.Recent(7, "a", 0, opts()), 2)
-		assert.Len(t, snap.Recent(0, "", 0, opts()), 5, "0 days means no cutoff, undated messages included")
+		got, err = snap.Recent(context.Background(), 7, "a", 0, opts())
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+		got, err = snap.Recent(context.Background(), 0, "", 0, opts())
+		require.NoError(t, err)
+		assert.Len(t, got, 5, "0 days means no cutoff, undated messages included")
 	})
 	t.Run("read conversation keeps the newest, oldest first", func(t *testing.T) {
 		t.Parallel()
-		got := snap.ReadConversation("c1", "", 2)
+		got, err := snap.ReadConversation(context.Background(), "c1", "", 2)
+		require.NoError(t, err)
 		require.Len(t, got, 2)
 		assert.Equal(t, "2", got[0].MessageID)
 		assert.Equal(t, "1", got[1].MessageID)
 	})
 	t.Run("conversations need a title or a last message", func(t *testing.T) {
 		t.Parallel()
-		assert.Len(t, snap.ListConversations("", 0), 2)
-		assert.Len(t, snap.ListConversations("b", 0), 1)
+		got, err := snap.ListConversations(context.Background(), "", 0)
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+		got, err = snap.ListConversations(context.Background(), "b", 0)
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
 	})
 	t.Run("mentions", func(t *testing.T) {
 		t.Parallel()
-		all := snap.MentionsQuery(0, false, "", 0, opts())
+		all, err := snap.MentionsQuery(context.Background(), 0, false, "", 0, opts())
+		require.NoError(t, err)
 		require.Len(t, all, 2)
 		assert.Equal(t, "Plan", all[0].Conversation)
 		assert.Equal(t, "Budge", all[0].Content, "content is cut to MaxContent characters")
 		assert.Equal(t, "c2", all[1].Conversation, "without a title, the id is shown")
-		assert.Len(t, snap.MentionsQuery(0, true, "", 0, opts()), 1)
-		assert.Len(t, snap.MentionsQuery(5, false, "", 0, opts()), 1)
+		all, err = snap.MentionsQuery(context.Background(), 0, true, "", 0, opts())
+		require.NoError(t, err)
+		assert.Len(t, all, 1)
+		all, err = snap.MentionsQuery(context.Background(), 5, false, "", 0, opts())
+		require.NoError(t, err)
+		assert.Len(t, all, 1)
 	})
 	t.Run("overview groups by conversation", func(t *testing.T) {
 		t.Parallel()
-		got := snap.Overview(7, "", opts())
+		got, err := snap.Overview(context.Background(), 7, "", opts())
+		require.NoError(t, err)
 		require.Len(t, got, 2)
 		assert.Equal(t, "c3", got[0].ConversationID)
 		assert.Equal(t, OverviewRow{
 			Conversation: "Plan", ConversationID: "c1", Count: 2, Senders: []string{"Ann (Org)", "Bob"},
 			LastSender: "Ann (Org)", LastMessage: "Budge", LastTime: ms(1), Account: "a",
 		}, got[1], "the last message is cut to MaxContent characters")
-		assert.Len(t, snap.Overview(0, "", opts()), 3, "0 days means no cutoff")
+		got, err = snap.Overview(context.Background(), 0, "", opts())
+		require.NoError(t, err)
+		assert.Len(t, got, 3, "0 days means no cutoff")
 	})
 }
 
@@ -133,9 +158,12 @@ func TestTruncate(t *testing.T) {
 
 func TestOptionsWithoutNow(t *testing.T) {
 	t.Parallel()
-	snap := &Snapshot{Messages: []teams.Message{msg("a", "c", "1", "Ann", ms(0), "hi")}}
+	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	snap := &Snapshot{Messages: []teams.Message{msg("a", "c", "1", "Ann", ts, "hi")}}
 
-	assert.Len(t, snap.Search("hi", "", 1, 0, Options{}), 1, "a nil Now means time.Now")
+	got, err := snap.Search(context.Background(), "hi", "", 1, 0, Options{})
+	require.NoError(t, err)
+	assert.Len(t, got, 1, "a nil Now means time.Now")
 }
 
 func TestMentionContentComesFromTheNewestVersion(t *testing.T) {
@@ -151,7 +179,8 @@ func TestMentionContentComesFromTheNewestVersion(t *testing.T) {
 		Mentions: []teams.Mention{{Account: "a", ConversationID: "c", MessageID: "m", Timestamp: ms(0)}},
 	}
 
-	got := snap.MentionsQuery(0, false, "", 0, Options{})
+	got, err := snap.MentionsQuery(context.Background(), 0, false, "", 0, Options{})
+	require.NoError(t, err)
 
 	require.Len(t, got, 1)
 	assert.Equal(t, "edited text", got[0].Content)
@@ -224,6 +253,44 @@ func TestCacheParsesAgainWhenTheFolderChanges(t *testing.T) {
 	assert.Equal(t, []Account{{Key: "t:u", TenantID: "t", UserID: "u"}}, changed.Accounts)
 }
 
+func TestCacheHonorsCancellation(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	cache := NewCache(dir, time.Hour, slog.New(slog.DiscardHandler))
+	_, err := cache.Snapshot(context.Background())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	snap, err := cache.Snapshot(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, snap, "an already canceled request does not receive a cached snapshot")
+
+	cache.gate <- struct{}{}
+	t.Cleanup(func() { <-cache.gate })
+	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+	t.Cleanup(cancel)
+	snap, err = cache.Snapshot(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Nil(t, snap, "waiting for another load respects the request deadline")
+}
+
+func TestLoadReportsDamagedSections(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "999999.ldb"), []byte("corrupt"), 0o600))
+
+	snap, err := Load(context.Background(), dir, slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	require.Len(t, snap.Damage, 1)
+	assert.Equal(t, "999999.ldb", snap.Damage[0].File)
+	assert.Zero(t, snap.Skipped, "file damage is counted separately from undecodable records")
+	assert.Len(t, snap.Messages, 2)
+}
+
 func TestOverviewPrefersTheNewerVersionOnEqualTimes(t *testing.T) {
 	t.Parallel()
 	ts := ms(1)
@@ -234,7 +301,8 @@ func TestOverviewPrefersTheNewerVersionOnEqualTimes(t *testing.T) {
 	undated := msg("a", "d", "x", "Bob", "", "no time")
 	snap := &Snapshot{Messages: []teams.Message{older, newer, undated}}
 
-	got := snap.Overview(0, "", Options{})
+	got, err := snap.Overview(context.Background(), 0, "", Options{})
+	require.NoError(t, err)
 
 	require.Len(t, got, 2)
 	assert.Equal(t, "after the edit", got[0].LastMessage)
@@ -249,7 +317,8 @@ func TestSearchReturnsTheNewestMatchesFirst(t *testing.T) {
 		msg("a", "c", "new", "Ann", ms(1), "budget"),
 	}}
 
-	got := snap.Search("budget", "", 0, 2, opts())
+	got, err := snap.Search(context.Background(), "budget", "", 0, 2, opts())
+	require.NoError(t, err)
 
 	require.Len(t, got, 2)
 	assert.Equal(t, []string{"new", "old"}, []string{got[0].MessageID, got[1].MessageID})
@@ -261,4 +330,50 @@ func TestEpochMillisRejectsNonFiniteValues(t *testing.T) {
 		_, ok := EpochMillis(ts)
 		assert.False(t, ok, ts)
 	}
+}
+
+func TestQueriesStopAfterSnapshotLoadIsCanceled(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	cache := NewCache(dir, time.Hour, slog.New(slog.DiscardHandler))
+	snap, err := cache.Snapshot(context.Background())
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, query := range []func() error{
+		func() error { _, err := snap.Search(ctx, "budget", "", 0, 0, Options{}); return err },
+		func() error { _, err := snap.Recent(ctx, 0, "", 0, Options{}); return err },
+		func() error { _, err := snap.ReadConversation(ctx, "c1", "", 0); return err },
+		func() error { _, err := snap.ListConversations(ctx, "", 0); return err },
+		func() error { _, err := snap.MentionsQuery(ctx, 0, false, "", 0, Options{}); return err },
+		func() error { _, err := snap.Overview(ctx, 0, "", Options{}); return err },
+		func() error { _, err := Rows(ctx, snap.Messages, 600); return err },
+	} {
+		require.ErrorIs(t, query(), context.Canceled)
+	}
+	ctx, cancel = context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	options := Options{Now: func() time.Time { cancel(); return time.Now() }}
+	rows, err := snap.Search(ctx, "budget", "", 7, 0, options)
+	require.ErrorIs(t, err, context.Canceled, "cancellation after the query starts stops the scan")
+	assert.Nil(t, rows)
+}
+
+func TestSortContextPreservesOrderAndStopsDuringSorting(t *testing.T) {
+	t.Parallel()
+	type item struct{ key, id int }
+	items := []item{{2, 1}, {1, 2}, {1, 3}, {3, 4}, {2, 5}}
+	require.NoError(t, sortContext(context.Background(), items, func(a, b item) bool { return a.key < b.key }))
+	assert.Equal(t, []item{{1, 2}, {1, 3}, {2, 1}, {2, 5}, {3, 4}}, items)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	comparisons := 0
+	err := sortContext(ctx, []int{5, 4, 3, 2, 1}, func(a, b int) bool {
+		comparisons++
+		cancel()
+		return a < b
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, comparisons)
 }

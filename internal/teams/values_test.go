@@ -81,7 +81,6 @@ func TestText(t *testing.T) {
 		{"<div>Hello &amp; <b>you</b></div>", "Hello & you"},
 		{"  spaced ", "spaced"},
 		{"\x1ctext\x1f", "text"},
-		// Undefined becomes "<Undefined>", which the tag filter removes.
 		{v8.Undefined{}, ""},
 		{int64(12), "12"},
 		{[]byte("raw"), "raw"},
@@ -92,6 +91,26 @@ func TestText(t *testing.T) {
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, text(tt.in), "text(%#v)", tt.in)
 	}
+}
+
+func TestMessageTextPreservesPlainContent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		kind    string
+		content string
+		want    string
+	}{
+		{"Text", "Keep x < 5 > 3 unchanged", "Keep x < 5 > 3 unchanged"},
+		{"Text", "Use <placeholder> &amp; here", "Use <placeholder> &amp; here"},
+		{"RichText/Html", "<p>Hello &amp; <b>you</b></p>", "Hello & you"},
+		{"RichText/Media_GenericFile", "<URIObject><Title>Report</Title></URIObject>", "Report"},
+		{"ThreadActivity/AddMember", "<addmember>Ann joined</addmember>", "Ann joined"},
+		{"", "<p>Legacy</p>", "Legacy"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, messageText(obj("messageType", tt.kind, "content", tt.content)))
+	}
+	assert.Equal(t, "Ann <guest> &amp; Co", plainText("Ann <guest> &amp; Co"))
 }
 
 func TestOrgLabel(t *testing.T) {
