@@ -248,6 +248,44 @@ func TestBlobFilesExcludeUnreferencedAndDeletedEntries(t *testing.T) {
 	assert.Equal(t, []string{filepath.Join("1", "00", "2")}, db.BlobFiles())
 }
 
+func TestBlobFilesForFiltersByStore(t *testing.T) {
+	t.Parallel()
+	entry := func(number byte) []byte { return []byte{0, number, 0, 1} }
+	key := func(dbID, storeID uint64, name byte) []byte {
+		return append(makePrefix(dbID, storeID, indexBlobEntry), 1, 1, 0, name)
+	}
+	db := &DB{ctx: context.Background(), records: []leveldb.Record{
+		{Key: key(1, 1, 'a'), Value: entry(1), Seq: 1, State: leveldb.Live, FileType: leveldb.Log},
+		{Key: key(1, 2, 'b'), Value: entry(2), Seq: 2, State: leveldb.Live, FileType: leveldb.Log},
+		{Key: key(2, 1, 'c'), Value: entry(3), Seq: 3, State: leveldb.Live, FileType: leveldb.Log},
+	}}
+
+	got := db.BlobFilesFor(func(dbNumber, storeID uint64) bool {
+		return dbNumber == 1 && storeID == 2
+	})
+
+	assert.Equal(t, []string{filepath.Join("1", "00", "2")}, got)
+}
+
+func TestRecordsUsesParsedPrefixLengthForNonMinimalPrefixes(t *testing.T) {
+	t.Parallel()
+	// Encode dbID=1 with 2 bytes (non-minimal prefix length 6 instead of 4)
+	// followed by a string key "k" and Blink-wrapped string "ok".
+	key := append([]byte{0x20, 0x01, 0x00, 0x01, 0x01}, 1, 1, 0, 'k')
+	val := append([]byte{1}, idbtest.Envelope("ok")...)
+	db := &DB{ctx: context.Background(), records: []leveldb.Record{
+		{Key: key, Value: val, Seq: 1, State: leveldb.Live, FileType: leveldb.Log},
+	}}
+
+	var got []Record
+	for rec := range db.Records(1, 1, func(err error) { t.Fatalf("unexpected error: %v", err) }) {
+		got = append(got, rec)
+	}
+
+	require.Len(t, got, 1)
+	assert.Equal(t, "ok", got[0].Value)
+}
+
 func TestReadBlobRejectsOversizedFile(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

@@ -61,16 +61,26 @@ type Account struct {
 // Key returns "<tenantId>:<userId>", the value of the account filters.
 func (a Account) Key() string { return a.TenantID + ":" + a.UserID }
 
+// Profile holds account metadata for the signed-in user from the profiles store.
+type Profile struct {
+	Account     string
+	TenantName  string
+	DisplayName string
+	Email       string
+}
+
 // Message is one cached message.
 type Message struct {
-	Account        string `json:"account"`
-	ConversationID string `json:"conversation_id"`
-	ReplyChainID   string `json:"reply_chain_id"`
-	MessageID      string `json:"message_id"`
-	Sender         string `json:"sender"`
-	Timestamp      string `json:"timestamp"`
-	Content        string `json:"content"`
-	ContentType    string `json:"content_type"`
+	Account             string `json:"account"`
+	ConversationID      string `json:"conversation_id"`
+	ReplyChainID        string `json:"reply_chain_id"`
+	MessageID           string `json:"message_id"`
+	Sender              string `json:"sender"`
+	Creator             string `json:"creator,omitempty"`
+	IsSentByCurrentUser *bool  `json:"is_sent_by_current_user,omitempty"`
+	Timestamp           string `json:"timestamp"`
+	Content             string `json:"content"`
+	ContentType         string `json:"content_type"`
 	// Seq is the LevelDB sequence number of the record version; a higher
 	// number is a newer version.
 	Seq uint64 `json:"-"`
@@ -99,18 +109,37 @@ type Mention struct {
 
 // Reader reads a Teams cache.
 type Reader struct {
-	db      *indexeddb.DB
-	tmp     string
-	skipped int
-	damage  []leveldb.Damage
-	logger  *slog.Logger
+	db         *indexeddb.DB
+	tmp        string
+	sourcePath string
+	blobScope  Scope
+	skipped    int
+	damage     []leveldb.Damage
+	logger     *slog.Logger
 }
+
+// Scope selects which Teams stores Open copies external blobs for.
+type Scope uint8
+
+// Store scopes.
+const (
+	ScopeMessages Scope = 1 << iota
+	ScopeConversations
+	ScopeMentions
+	ScopeProfiles
+	ScopeAll = ScopeMessages | ScopeConversations | ScopeMentions | ScopeProfiles
+)
 
 // Open reads the Teams LevelDB in path, or the auto-discovered one when path
 // is empty. The folder is first copied to a temporary folder, because the
 // running Teams client holds a lock on it. Call Close to remove the copy.
 // When ctx is canceled, Open removes the copy and returns the context's error.
 func Open(ctx context.Context, path string, logger *slog.Logger) (*Reader, error) {
+	return OpenFor(ctx, path, logger, ScopeAll)
+}
+
+// OpenFor works like Open, but copies external blobs only for the stores in scope.
+func OpenFor(ctx context.Context, path string, logger *slog.Logger, scope Scope) (*Reader, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -126,9 +155,10 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*Reader, error
 	if err != nil {
 		return nil, fmt.Errorf("create temporary folder: %w", err)
 	}
-	r := &Reader{tmp: tmp, logger: logger}
-	copyDir := filepath.Join(tmp, filepath.Base(path))
-	if err := copyDataFiles(ctx, path, copyDir, logger); err != nil {
+	r := &Reader{tmp: tmp, sourcePath: path, logger: logger}
+	copyDir := filepath.Join(tmp, "leveldb")
+	stable, err := copyDataFiles(ctx, path, copyDir, logger)
+	if err != nil {
 		r.Close()
 		return nil, err
 	}
@@ -139,16 +169,43 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*Reader, error
 		return nil, err
 	}
 	r.damage = r.db.Damage()
-	for _, file := range r.db.BlobFiles() {
+	if !stable {
+		r.damage = append(r.damage, leveldb.Damage{
+			File:   filepath.Base(filepath.Clean(path)),
+			Reason: "cache changed during copy; result can miss recent data",
+		})
+	}
+	if err := r.EnsureBlobs(ctx, scope); err != nil {
+		r.Close()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		r.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+// EnsureBlobs copies external blobs needed by any newly requested stores in scope.
+func (r *Reader) EnsureBlobs(ctx context.Context, scope Scope) error {
+	missing := scope &^ r.blobScope
+	if missing == 0 {
+		return ctx.Err()
+	}
+	blobAccept := r.blobFilter(missing)
+	if blobAccept == nil {
+		r.blobScope |= missing
+		return ctx.Err()
+	}
+	copyBlobDir := filepath.Join(r.tmp, "blobs")
+	for _, file := range r.db.BlobFilesFor(blobAccept) {
 		dst := filepath.Join(copyBlobDir, file)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-			r.Close()
-			return nil, fmt.Errorf("create blob copy folder: %w", err)
+			return fmt.Errorf("create blob copy folder: %w", err)
 		}
-		if err := copyFile(ctx, filepath.Join(blobDirFor(path), file), dst, leveldb.MaxDecodedSize); err != nil {
+		if err := copyFile(ctx, filepath.Join(blobDirFor(r.sourcePath), file), dst, leveldb.MaxDecodedSize); err != nil {
 			if ctx.Err() != nil {
-				r.Close()
-				return nil, ctx.Err()
+				return ctx.Err()
 			}
 			var sourceErr *sourceReadError
 			if errors.As(err, &sourceErr) || errors.Is(err, ErrBlobTooLarge) {
@@ -156,19 +213,48 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*Reader, error
 				if errors.Is(err, fs.ErrNotExist) {
 					reason = "referenced blob is missing"
 				}
-				logger.Warn("could not copy a referenced blob", "file", file, "error", err)
+				r.logger.Warn("could not copy a referenced blob", "file", file, "error", err)
 				r.damage = append(r.damage, leveldb.Damage{File: file, Reason: reason})
 				continue
 			}
-			r.Close()
-			return nil, err
+			return err
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		r.Close()
-		return nil, err
+	r.blobScope |= missing
+	return ctx.Err()
+}
+
+func (r *Reader) blobFilter(scope Scope) func(dbNumber, storeID uint64) bool {
+	type dbStore struct{ db, store uint64 }
+	allowed := map[dbStore]bool{}
+	add := func(manager, store string) {
+		for _, d := range r.db.Databases() {
+			if !strings.Contains(d.Name, "Teams:"+manager+":") || len(strings.Split(d.Name, ":")) < 6 {
+				continue
+			}
+			for _, id := range r.db.ObjectStoreIDs(d.Number, func(name string) bool { return isStore(name, store) }) {
+				allowed[dbStore{db: d.Number, store: id}] = true
+			}
+		}
 	}
-	return r, nil
+	if scope&ScopeMessages != 0 {
+		add("replychain-manager", "replychains")
+	}
+	if scope&ScopeConversations != 0 {
+		add("conversation-manager", "conversations")
+	}
+	if scope&ScopeMentions != 0 {
+		add("messaging-slice-manager", "mentions-metadata-items")
+	}
+	if scope&ScopeProfiles != 0 {
+		add("profiles", "profiles")
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	return func(dbNumber, storeID uint64) bool {
+		return allowed[dbStore{db: dbNumber, store: storeID}]
+	}
 }
 
 // Close removes the temporary copy.
@@ -194,18 +280,18 @@ const copyAttempts = 3
 // copyDataFiles copies the LevelDB table and log files of src to dst. Other
 // files are not needed, and the LOCK file can be locked by the running client.
 // When the set of files changes during the copy, the copy starts again.
-func copyDataFiles(ctx context.Context, src, dst string, logger *slog.Logger) error {
+func copyDataFiles(ctx context.Context, src, dst string, logger *slog.Logger) (bool, error) {
 	for attempt := 1; ; attempt++ {
 		stable, err := copyOnce(ctx, src, dst)
 		if err != nil || stable {
-			return err
+			return stable, err
 		}
 		if attempt == copyAttempts {
 			logger.Warn("the cache changed during each copy; the result can miss recent data", "attempts", attempt)
-			return nil
+			return false, nil
 		}
 		if err := os.RemoveAll(dst); err != nil {
-			return fmt.Errorf("remove incomplete copy: %w", err)
+			return false, fmt.Errorf("remove incomplete copy: %w", err)
 		}
 	}
 }
@@ -382,15 +468,23 @@ func current(records iter.Seq[storeRecord]) []storeRecord {
 	return out
 }
 
-// numberedStore matches the name of a numbered copy of a store, such as
+// isStore reports whether name is store or a numbered copy of it, such as
 // "replychains-2". Teams also writes records to such stores, and some
 // messages are only there.
-var numberedStore = regexp.MustCompile(`^(.+)-\d+$`)
-
-// isStore reports whether name is store or a numbered copy of it.
 func isStore(name, store string) bool {
-	m := numberedStore.FindStringSubmatch(name)
-	return name == store || (m != nil && m[1] == store)
+	if name == store {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(name, store+"-")
+	if !ok || suffix == "" {
+		return false
+	}
+	for i := range len(suffix) {
+		if suffix[i] < '0' || suffix[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // records yields every record version of one object store.
@@ -470,12 +564,82 @@ func (r *Reader) Mentions(account string) []Mention {
 	return mentions(r.stores, account)
 }
 
+// Profiles returns the signed-in user's profile per account from the profiles store.
+func (r *Reader) Profiles(account string) []Profile {
+	return profiles(r.stores, account)
+}
+
 func accounts(stores storeFunc) []Account {
 	var out []Account
 	for acc := range stores("replychain-manager", "replychains") {
 		out = append(out, acc)
 	}
 	return out
+}
+
+func profiles(stores storeFunc, account string) []Profile {
+	type matched struct {
+		profile    Profile
+		tenantSeq  uint64
+		displaySeq uint64
+		emailSeq   uint64
+	}
+	best := map[string]matched{}
+	var order []string
+	for acc, values := range stores("profiles", "profiles") {
+		key := acc.Key()
+		if account != "" && key != account {
+			continue
+		}
+		for _, rec := range current(values) {
+			v, ok := rec.value.(*v8.Object)
+			if !ok {
+				continue
+			}
+			oid := plainText(get(v, "objectId"))
+			mri := plainText(get(v, "mri"))
+			if !matchesUserID(acc.UserID, oid, mri) {
+				continue
+			}
+			tenantName := plainText(get(v, "tenantName"))
+			displayName := plainText(get(v, "displayName"))
+			email := plainText(or(get(v, "email"), or(get(v, "mail"), get(v, "userPrincipalName"))))
+			if tenantName == "" && displayName == "" && email == "" {
+				continue
+			}
+			m, seen := best[key]
+			if !seen {
+				order = append(order, key)
+				m.profile.Account = key
+			}
+			if tenantName != "" && (m.profile.TenantName == "" || rec.seq >= m.tenantSeq) {
+				m.profile.TenantName, m.tenantSeq = tenantName, rec.seq
+			}
+			if displayName != "" && (m.profile.DisplayName == "" || rec.seq >= m.displaySeq) {
+				m.profile.DisplayName, m.displaySeq = displayName, rec.seq
+			}
+			if email != "" && (m.profile.Email == "" || rec.seq >= m.emailSeq) {
+				m.profile.Email, m.emailSeq = email, rec.seq
+			}
+			best[key] = m
+		}
+	}
+	out := make([]Profile, 0, len(order))
+	for _, key := range order {
+		out = append(out, best[key].profile)
+	}
+	return out
+}
+
+func matchesUserID(userID, objectID, mri string) bool {
+	if userID == "" {
+		return false
+	}
+	if strings.EqualFold(objectID, userID) || strings.EqualFold(mri, userID) {
+		return true
+	}
+	return len(mri) > len(userID)+1 && mri[len(mri)-len(userID)-1] == ':' &&
+		strings.EqualFold(mri[len(mri)-len(userID):], userID)
 }
 
 func messages(stores storeFunc, account string) []Message {
@@ -512,16 +676,22 @@ func messages(stores storeFunc, account string) []Message {
 				if !ok {
 					continue
 				}
+				var sentByMe *bool
+				if b, ok := get(msg, "isSentByCurrentUser").(bool); ok {
+					sentByMe = &b
+				}
 				m := Message{
-					Account:        acc.Key(),
-					ConversationID: valueString(getOr(rec, "conversationId", "")),
-					ReplyChainID:   valueString(getOr(rec, "replyChainId", "")),
-					MessageID:      valueString(getOr(msg, "id", mid)),
-					Sender:         text(or(get(msg, "imDisplayName"), get(msg, "from"))),
-					Timestamp:      valueString(or(or(get(msg, "originalArrivalTime"), get(msg, "composetime")), "")),
-					Content:        messageText(msg),
-					ContentType:    valueString(or(get(msg, "messageType"), "")),
-					Seq:            version.seq,
+					Account:             acc.Key(),
+					ConversationID:      valueString(getOr(rec, "conversationId", "")),
+					ReplyChainID:        valueString(getOr(rec, "replyChainId", "")),
+					MessageID:           valueString(getOr(msg, "id", mid)),
+					Sender:              text(or(get(msg, "imDisplayName"), get(msg, "from"))),
+					Creator:             plainText(or(get(msg, "creator"), get(msg, "from"))),
+					IsSentByCurrentUser: sentByMe,
+					Timestamp:           valueString(or(or(get(msg, "originalArrivalTime"), get(msg, "composetime")), "")),
+					Content:             messageText(msg),
+					ContentType:         valueString(or(get(msg, "messageType"), "")),
+					Seq:                 version.seq,
 				}
 				k := messageKey{account: m.Account, conversation: m.ConversationID, id: m.MessageID}
 				if m.MessageID == "" { // without an id, only the same entry of the same chain is the same message
@@ -609,13 +779,14 @@ func mentions(stores storeFunc, account string) []Mention {
 			if !ok {
 				continue
 			}
+			isRead, _ := get(v, "isRead").(bool)
 			out = append(out, Mention{
 				Account:        acc.Key(),
 				ConversationID: valueString(getOr(v, "sourceThreadId", "")),
 				MessageID:      valueString(getOr(v, "sourceMessageId", "")),
 				ReplyChainID:   valueString(getOr(v, "sourceReplyChainId", "")),
 				Timestamp:      valueString(getOr(v, "timestamp", "")),
-				IsRead:         valueString(get(v, "isRead")) == "True",
+				IsRead:         isRead,
 			})
 		}
 	}

@@ -23,9 +23,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // ErrCorrupt reports data that does not follow the LevelDB file formats.
@@ -114,6 +117,66 @@ type dataFile struct {
 	isLog  bool
 }
 
+type fileWarning struct {
+	msg  string
+	args []any
+}
+
+func sectionWarning(msg, path string, offset, length int64, reason string) fileWarning {
+	return fileWarning{
+		msg:  msg,
+		args: []any{"file", path, "offset", offset, "length", length, "reason", reason},
+	}
+}
+
+type fileResult struct {
+	records  []Record
+	damage   []Damage
+	warnings []fileWarning
+	err      error
+}
+
+func parseDataFile(ctx context.Context, f dataFile) fileResult {
+	data, err := readFile(ctx, f.path)
+	if err != nil {
+		return fileResult{err: fmt.Errorf("read %s: %w", f.path, err)}
+	}
+	if f.isLog {
+		recs, sections, err := parseLog(ctx, data, f.path)
+		if err != nil {
+			return fileResult{err: err}
+		}
+		res := fileResult{
+			records:  recs,
+			damage:   make([]Damage, 0, len(sections)),
+			warnings: make([]fileWarning, 0, len(sections)),
+		}
+		for _, d := range sections {
+			res.warnings = append(res.warnings, sectionWarning("skipped damaged log data", f.path, d.offset, d.length, d.reason))
+			res.damage = append(res.damage, Damage{File: filepath.Base(f.path), Offset: d.offset, Length: d.length, Reason: d.reason})
+		}
+		return res
+	}
+	recs, sections, err := parseTable(ctx, data, f.path)
+	if ctx.Err() != nil {
+		return fileResult{err: ctx.Err()}
+	}
+	var res fileResult
+	res.records = recs
+	if err != nil {
+		res.warnings = append(res.warnings, fileWarning{
+			msg:  "skipped the unreadable part of a table file",
+			args: []any{"file", f.path, "records_read", len(recs), "error", err},
+		})
+		res.damage = append(res.damage, Damage{File: filepath.Base(f.path), Length: int64(len(data)), Reason: err.Error()})
+	}
+	for _, section := range sections {
+		res.warnings = append(res.warnings, sectionWarning("skipped damaged table data", f.path, section.Offset, section.Length, section.Reason))
+	}
+	res.damage = append(res.damage, sections...)
+	return res
+}
+
 // ReadDir returns all records of the LevelDB in dir, in file-number order.
 // Within a file, records keep their on-disk order.
 //
@@ -147,41 +210,63 @@ func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, []
 	}
 	sort.SliceStable(files, func(i, j int) bool { return files[i].number < files[j].number })
 
-	var records []Record
-	damage := []Damage{}
-	for _, f := range files {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+	results := make([]fileResult, len(files))
+	var firstErr error
+	if len(files) > 0 {
+		workers := min(runtime.GOMAXPROCS(0), len(files))
+		workCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var next atomic.Int64
+		var errOnce sync.Once
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					i := int(next.Add(1) - 1)
+					if i >= len(files) {
+						return
+					}
+					if err := workCtx.Err(); err != nil {
+						results[i] = fileResult{err: err}
+						return
+					}
+					res := parseDataFile(workCtx, files[i])
+					results[i] = res
+					if res.err != nil {
+						errOnce.Do(func() { firstErr = res.err })
+						cancel()
+						return
+					}
+				}
+			}()
 		}
-		data, err := readFile(ctx, f.path)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read %s: %w", f.path, err)
+		wg.Wait()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if firstErr != nil {
+		return nil, nil, firstErr
+	}
+
+	var totalRecords, totalDamage int
+	for i := range results {
+		if results[i].err != nil {
+			return nil, nil, results[i].err
 		}
-		if f.isLog {
-			recs, sections, err := parseLog(ctx, data, f.path)
-			if err != nil {
-				return nil, nil, err
-			}
-			for _, d := range sections {
-				logger.Warn("skipped damaged log data", "file", f.path, "offset", d.offset, "length", d.length, "reason", d.reason)
-				damage = append(damage, Damage{File: filepath.Base(f.path), Offset: d.offset, Length: d.length, Reason: d.reason})
-			}
-			records = append(records, recs...)
-			continue
+		totalRecords += len(results[i].records)
+		totalDamage += len(results[i].damage)
+	}
+	records := make([]Record, 0, totalRecords)
+	damage := make([]Damage, 0, totalDamage)
+	for i := range results {
+		for _, w := range results[i].warnings {
+			logger.Warn(w.msg, w.args...)
 		}
-		recs, sections, err := parseTable(ctx, data, f.path)
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
-		if err != nil {
-			logger.Warn("skipped the unreadable part of a table file", "file", f.path, "records_read", len(recs), "error", err)
-			damage = append(damage, Damage{File: filepath.Base(f.path), Length: int64(len(data)), Reason: err.Error()})
-		}
-		for _, section := range sections {
-			logger.Warn("skipped damaged table data", "file", f.path, "offset", section.Offset, "length", section.Length, "reason", section.Reason)
-		}
-		damage = append(damage, sections...)
-		records = append(records, recs...)
+		records = append(records, results[i].records...)
+		damage = append(damage, results[i].damage...)
 	}
 	return records, damage, nil
 }

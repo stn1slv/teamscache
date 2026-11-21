@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/stn1slv/teamscache/internal/leveldb"
 	"github.com/stn1slv/teamscache/internal/teams"
@@ -27,29 +26,57 @@ type Snapshot struct {
 	Damage        []leveldb.Damage
 }
 
-// Account is a (tenant, user) context with a best-effort organization label,
-// the most frequent "(Org)" suffix of sender names in its messages.
+// Account is a (tenant, user) context with a label from the user's profile
+// (tenantName) or, as a fallback, the most frequent "(Org)" suffix of sender
+// names in its messages.
 type Account struct {
-	Key      string `json:"key"`
-	TenantID string `json:"tenant_id"`
-	UserID   string `json:"user_id"`
-	Label    string `json:"label"`
+	Key         string `json:"key"`
+	TenantID    string `json:"tenant_id"`
+	UserID      string `json:"user_id"`
+	Label       string `json:"label"`
+	TenantName  string `json:"tenant_name,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	Email       string `json:"email,omitempty"`
 }
 
 // Load parses the cache in path, or the auto-discovered one when path is "".
 // It stops with the context's error when ctx is canceled.
 func Load(ctx context.Context, path string, logger *slog.Logger) (*Snapshot, error) {
-	r, err := teams.Open(ctx, path, logger)
+	return LoadFor(ctx, path, logger, teams.ScopeAll)
+}
+
+// LoadFor parses only the stores selected by scope from the cache in path.
+// When ScopeProfiles is included without ScopeMessages, messages and their
+// blobs are loaded only if any account lacks a tenant name in its profile.
+func LoadFor(ctx context.Context, path string, logger *slog.Logger, scope teams.Scope) (*Snapshot, error) {
+	r, err := teams.OpenFor(ctx, path, logger, scope)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	snap := &Snapshot{
-		Messages:      r.Messages(""),
-		Conversations: r.Conversations(""),
-		Mentions:      r.Mentions(""),
+	rawAccounts := r.Accounts()
+	var profiles []teams.Profile
+	if scope&teams.ScopeProfiles != 0 {
+		profiles = r.Profiles("")
 	}
-	snap.Accounts = accountsWithLabels(r.Accounts(), snap.Messages)
+	snap := &Snapshot{}
+	needMessages := scope&teams.ScopeMessages != 0
+	if !needMessages && scope&teams.ScopeProfiles != 0 && needsLabelFallback(rawAccounts, profiles) {
+		if err := r.EnsureBlobs(ctx, teams.ScopeMessages); err != nil {
+			return nil, err
+		}
+		needMessages = true
+	}
+	if needMessages {
+		snap.Messages = r.Messages("")
+	}
+	if scope&teams.ScopeConversations != 0 {
+		snap.Conversations = r.Conversations("")
+	}
+	if scope&teams.ScopeMentions != 0 {
+		snap.Mentions = r.Mentions("")
+	}
+	snap.Accounts = accountsWithProfiles(rawAccounts, profiles, snap.Messages)
 	snap.Skipped = r.Skipped()
 	snap.Damage = r.Damage()
 	if err := ctx.Err(); err != nil {
@@ -58,7 +85,33 @@ func Load(ctx context.Context, path string, logger *slog.Logger) (*Snapshot, err
 	return snap, nil
 }
 
+func needsLabelFallback(accounts []teams.Account, profiles []teams.Profile) bool {
+	if len(accounts) == 0 {
+		return false
+	}
+	hasTenant := make(map[string]bool, len(profiles))
+	for _, p := range profiles {
+		if p.TenantName != "" {
+			hasTenant[p.Account] = true
+		}
+	}
+	for _, a := range accounts {
+		if !hasTenant[a.Key()] {
+			return true
+		}
+	}
+	return false
+}
+
 func accountsWithLabels(accounts []teams.Account, messages []teams.Message) []Account {
+	return accountsWithProfiles(accounts, nil, messages)
+}
+
+func accountsWithProfiles(accounts []teams.Account, profiles []teams.Profile, messages []teams.Message) []Account {
+	byProfile := make(map[string]teams.Profile, len(profiles))
+	for _, p := range profiles {
+		byProfile[p.Account] = p
+	}
 	type counter struct {
 		counts map[string]int
 		order  []string
@@ -87,16 +140,27 @@ func accountsWithLabels(accounts []teams.Account, messages []teams.Message) []Ac
 			continue
 		}
 		seen[key] = true
-		label := ""
-		if c := labels[key]; c != nil {
-			best := 0
-			for _, org := range c.order { // ties go to the label seen first
-				if c.counts[org] > best {
-					best, label = c.counts[org], org
+		prof := byProfile[key]
+		label := prof.TenantName
+		if label == "" {
+			if c := labels[key]; c != nil {
+				best := 0
+				for _, org := range c.order { // ties go to the label seen first
+					if c.counts[org] > best {
+						best, label = c.counts[org], org
+					}
 				}
 			}
 		}
-		out = append(out, Account{Key: key, TenantID: a.TenantID, UserID: a.UserID, Label: label})
+		out = append(out, Account{
+			Key:         key,
+			TenantID:    a.TenantID,
+			UserID:      a.UserID,
+			Label:       label,
+			TenantName:  prof.TenantName,
+			DisplayName: prof.DisplayName,
+			Email:       prof.Email,
+		})
 	}
 	return out
 }
@@ -199,10 +263,11 @@ func (o Options) cutoff(days int) float64 {
 // EpochMillis parses a Teams timestamp: epoch milliseconds as text (like
 // "1768557031836.0"), or an ISO 8601 date.
 func EpochMillis(ts string) (float64, bool) {
+	ts = strings.TrimSpace(ts)
 	if ts == "" {
 		return 0, false
 	}
-	if f, err := strconv.ParseFloat(strings.TrimSpace(ts), 64); err == nil {
+	if f, err := strconv.ParseFloat(ts, 64); err == nil {
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return 0, false
 		}
@@ -295,21 +360,20 @@ func untimed[T any](ctx context.Context, items []timed[T]) ([]T, error) {
 	return out, ctx.Err()
 }
 
-// firstChars returns the first n characters of s.
-func firstChars(s string, n int) string {
-	if n <= 0 || utf8.RuneCountInString(s) <= n {
-		return s
-	}
-	return string([]rune(s)[:n])
-}
-
 // Truncate shortens s to n characters and marks the cut with an ellipsis. A
 // limit of 0 or less means no limit.
 func Truncate(s string, n int) string {
-	if n <= 0 || utf8.RuneCountInString(s) <= n {
+	if n <= 0 {
 		return s
 	}
-	return firstChars(s, n) + "…"
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i] + "…"
+		}
+		count++
+	}
+	return s
 }
 
 // limited returns at most limit items; a limit of 0 or less means no limit.
@@ -321,9 +385,9 @@ func limited[T any](items []T, limit int) []T {
 }
 
 // ListConversations returns chats and channels that have a title or a last
-// message.
+// message, sorted by last message time newest first.
 func (s *Snapshot) ListConversations(ctx context.Context, account string, limit int) ([]teams.Conversation, error) {
-	out := []teams.Conversation{}
+	var items []timed[teams.Conversation]
 	for _, c := range s.Conversations {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -332,13 +396,13 @@ func (s *Snapshot) ListConversations(ctx context.Context, account string, limit 
 			continue
 		}
 		if c.Title != "" || c.LastMessage != "" {
-			out = append(out, c)
-		}
-		if limit > 0 && len(out) >= limit {
-			break
+			items = append(items, withTime(c, c.LastMessageTime))
 		}
 	}
-	return out, ctx.Err()
+	if err := newestFirst(ctx, items); err != nil {
+		return nil, err
+	}
+	return untimed(ctx, limited(items, limit))
 }
 
 // ReadConversation returns the last limit messages of a conversation, oldest
@@ -513,7 +577,7 @@ func (s *Snapshot) MentionsQuery(ctx context.Context, days int, unreadOnly bool,
 		}
 		if m, ok := content.find(mt.Account, mt.ConversationID, mt.MessageID); ok {
 			row.Sender = m.Sender
-			row.Content = firstChars(m.Content, opts.MaxContent)
+			row.Content = Truncate(m.Content, opts.MaxContent)
 		}
 		rows = append(rows, timed[MentionRow]{item: row, e: e, ok: ok})
 	}
@@ -609,7 +673,7 @@ func (s *Snapshot) Overview(ctx context.Context, days int, account string, opts 
 			row.Conversation = g.key.id
 		}
 		if g.last != nil {
-			row.LastSender, row.LastMessage, row.LastTime = g.last.Sender, firstChars(g.last.Content, opts.MaxContent), g.last.Timestamp
+			row.LastSender, row.LastMessage, row.LastTime = g.last.Sender, Truncate(g.last.Content, opts.MaxContent), g.last.Timestamp
 		}
 		rows = append(rows, timed[OverviewRow]{item: row, e: g.lastE, ok: g.lastOK})
 	}
@@ -621,11 +685,13 @@ func (s *Snapshot) Overview(ctx context.Context, days int, account string, opts 
 
 // MessageRow is a message in the compact form the MCP tools return.
 type MessageRow struct {
-	Sender         string `json:"sender"`
-	Timestamp      string `json:"timestamp"`
-	Content        string `json:"content"`
-	ConversationID string `json:"conversation_id"`
-	Account        string `json:"account"`
+	Sender              string `json:"sender"`
+	Creator             string `json:"creator,omitempty"`
+	IsSentByCurrentUser *bool  `json:"is_sent_by_current_user,omitempty"`
+	Timestamp           string `json:"timestamp"`
+	Content             string `json:"content"`
+	ConversationID      string `json:"conversation_id"`
+	Account             string `json:"account"`
 }
 
 // Rows converts messages to compact rows with content cut to maxContent
@@ -637,9 +703,71 @@ func Rows(ctx context.Context, msgs []teams.Message, maxContent int) ([]MessageR
 			return nil, err
 		}
 		out = append(out, MessageRow{
-			Sender: m.Sender, Timestamp: m.Timestamp, Content: Truncate(m.Content, maxContent),
+			Sender: m.Sender, Creator: m.Creator, IsSentByCurrentUser: m.IsSentByCurrentUser,
+			Timestamp: m.Timestamp, Content: Truncate(m.Content, maxContent),
 			ConversationID: m.ConversationID, Account: m.Account,
 		})
 	}
 	return out, ctx.Err()
+}
+
+// Dump is a full export of accounts, conversations, messages, and mentions.
+type Dump struct {
+	Accounts      []Account            `json:"accounts"`
+	Conversations []teams.Conversation `json:"conversations"`
+	Messages      []teams.Message      `json:"messages"`
+	Mentions      []MentionRow         `json:"mentions"`
+	Skipped       int                  `json:"skipped_records"`
+	Damage        []leveldb.Damage     `json:"damaged_sections"`
+	Partial       bool                 `json:"partial"`
+}
+
+// Dump returns accounts, conversations, messages (newest first), and mentions
+// (newest first) in one snapshot. When days is above 0, messages and mentions
+// are filtered to the last days days.
+func (s *Snapshot) Dump(ctx context.Context, days int, account string, opts Options) (Dump, error) {
+	accounts := []Account{}
+	for _, a := range s.Accounts {
+		if err := ctx.Err(); err != nil {
+			return Dump{}, err
+		}
+		if account == "" || a.Key == account {
+			accounts = append(accounts, a)
+		}
+	}
+	convs, err := s.ListConversations(ctx, account, 0)
+	if err != nil {
+		return Dump{}, err
+	}
+	if opts.MaxContent > 0 {
+		for i := range convs {
+			convs[i].LastMessage = Truncate(convs[i].LastMessage, opts.MaxContent)
+		}
+	}
+	msgs, err := s.Recent(ctx, days, account, 0, opts)
+	if err != nil {
+		return Dump{}, err
+	}
+	if opts.MaxContent > 0 {
+		for i := range msgs {
+			msgs[i].Content = Truncate(msgs[i].Content, opts.MaxContent)
+		}
+	}
+	mentions, err := s.MentionsQuery(ctx, days, false, account, 0, opts)
+	if err != nil {
+		return Dump{}, err
+	}
+	damage := s.Damage
+	if damage == nil {
+		damage = []leveldb.Damage{}
+	}
+	return Dump{
+		Accounts:      accounts,
+		Conversations: convs,
+		Messages:      msgs,
+		Mentions:      mentions,
+		Skipped:       s.Skipped,
+		Damage:        damage,
+		Partial:       s.Skipped > 0 || len(damage) > 0,
+	}, ctx.Err()
 }

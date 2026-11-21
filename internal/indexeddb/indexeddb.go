@@ -12,8 +12,8 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"slices"
 	"sort"
-	"strconv"
 	"unicode/utf16"
 
 	"github.com/stn1slv/teamscache/internal/leveldb"
@@ -36,6 +36,15 @@ type DatabaseID struct {
 	Name   string
 }
 
+type storeAddr struct {
+	db, store uint64
+}
+
+type indexedRecord struct {
+	idx       int
+	prefixLen int
+}
+
 // DB is an IndexedDB LevelDB, read into memory.
 type DB struct {
 	ctx       context.Context
@@ -47,6 +56,7 @@ type DB struct {
 	maxStoreID map[uint64]uint64
 	// storeNames[db][store] is the name of an object store.
 	storeNames map[uint64]map[uint64]string
+	storeIndex map[storeAddr][]indexedRecord
 	blobInfo   map[blobKey]blobInfo
 }
 
@@ -72,11 +82,20 @@ func (db *DB) Damage() []leveldb.Damage {
 
 // BlobFiles lists referenced blob files relative to the blob directory.
 func (db *DB) BlobFiles() []string {
+	return db.BlobFilesFor(nil)
+}
+
+// BlobFilesFor lists referenced blob files relative to the blob directory for
+// stores accepted by accept. A nil accept matches all stores.
+func (db *DB) BlobFilesFor(accept func(dbNumber, storeID uint64) bool) []string {
 	if db.blobInfo == nil {
 		db.loadBlobInfo()
 	}
 	seen := map[string]bool{}
 	for key, info := range db.blobInfo {
+		if accept != nil && !accept(key.db, key.store) {
+			continue
+		}
 		seen[blobPath("", key.db, info.number)] = true
 	}
 	files := make([]string, 0, len(seen))
@@ -92,50 +111,65 @@ func (db *DB) Databases() []DatabaseID {
 	return db.databases
 }
 
-// newestLive picks, for each key accepted by keyOf, the record with the
-// highest sequence number, and drops keys whose newest record is a deletion.
-// Records are visited newest file first, and the result keeps the order in
-// which keys were first seen.
-func (db *DB) newestLive(keyOf func(r *leveldb.Record) (string, bool)) ([]string, map[string]*leveldb.Record) {
-	var order []string
-	found := map[string]*leveldb.Record{}
-	for i := len(db.records) - 1; i >= 0; i-- {
-		if db.ctx.Err() != nil {
-			break
-		}
-		r := &db.records[i]
-		k, ok := keyOf(r)
-		if !ok {
-			continue
-		}
-		old, seen := found[k]
-		if !seen {
-			order = append(order, k)
-		}
-		if !seen || old.Seq < r.Seq {
-			found[k] = r
-		}
-	}
-	live := order[:0]
-	for _, k := range order {
-		if found[k].State == leveldb.Live {
-			live = append(live, k)
-		} else {
-			delete(found, k)
-		}
-	}
-	return live, found
-}
-
 func (db *DB) readMetadata() {
 	global := []byte{0, 0, 0, 0}
-	order, found := db.newestLive(func(r *leveldb.Record) (string, bool) {
+	var globalOrder []string
+	globalFound := map[string]*leveldb.Record{}
+	maxStoreMeta := map[uint64]*leveldb.Record{}
+	storeNameMeta := map[storeAddr]*leveldb.Record{}
+	storeIndex := map[storeAddr][]indexedRecord{}
+
+	for i := len(db.records) - 1; i >= 0; i-- {
+		if db.ctx != nil && db.ctx.Err() != nil {
+			return
+		}
+		r := &db.records[i]
 		key := r.UserKey()
-		return string(key), bytes.HasPrefix(key, global)
-	})
-	seen := map[uint64]bool{}
-	for _, k := range order {
-		r := found[k]
+		if bytes.HasPrefix(key, global) {
+			k := string(key)
+			old, seen := globalFound[k]
+			if !seen {
+				globalOrder = append(globalOrder, k)
+			}
+			if !seen || old.Seq < r.Seq {
+				globalFound[k] = r
+			}
+			continue
+		}
+		dbID, storeID, indexID, n, ok := readPrefix(key)
+		if !ok || dbID == 0 {
+			continue
+		}
+		if storeID == 0 && indexID == 0 && n < len(key) {
+			rest := key[n:]
+			switch rest[0] {
+			case dbMetaMaxObjectStoreID:
+				if old, seen := maxStoreMeta[dbID]; !seen || old.Seq < r.Seq {
+					maxStoreMeta[dbID] = r
+				}
+			case objectStoreMetaByte:
+				id, m := leveldb.Uvarint(rest[1:], 10)
+				if m > 0 && 1+m < len(rest) && rest[1+m] == objectStoreMetaName {
+					addr := storeAddr{db: dbID, store: id}
+					if old, seen := storeNameMeta[addr]; !seen || old.Seq < r.Seq {
+						storeNameMeta[addr] = r
+					}
+				}
+			}
+			continue
+		}
+		if storeID != 0 && indexID == indexObjectStoreData {
+			addr := storeAddr{db: dbID, store: storeID}
+			storeIndex[addr] = append(storeIndex[addr], indexedRecord{idx: i, prefixLen: n})
+		}
+	}
+
+	seenDB := map[uint64]bool{}
+	for _, k := range globalOrder {
+		r := globalFound[k]
+		if r.State != leveldb.Live {
+			continue
+		}
 		key := r.UserKey()
 		if len(key) < 5 || key[4] != databaseNamePrefixByte {
 			continue
@@ -149,53 +183,57 @@ func (db *DB) readMetadata() {
 			continue
 		}
 		number := truncatedInt(r.Value)
-		if seen[number] {
+		if seenDB[number] {
 			continue
 		}
-		seen[number] = true
+		seenDB[number] = true
 		db.databases = append(db.databases, DatabaseID{Number: number, Origin: origin, Name: name})
 	}
 
-	db.maxStoreID = map[uint64]uint64{}
-	db.storeNames = map[uint64]map[uint64]string{}
+	db.maxStoreID = make(map[uint64]uint64, len(db.databases))
+	db.storeNames = make(map[uint64]map[uint64]string, len(db.databases))
 	for _, d := range db.databases {
-		prefix := makePrefix(d.Number, 0, 0)
-		_, meta := db.newestLive(func(r *leveldb.Record) (string, bool) {
-			key := r.UserKey()
-			if !bytes.HasPrefix(key, prefix) || len(key) <= len(prefix) {
-				return "", false
-			}
-			return string(key[len(prefix) : len(prefix)+1]), true
-		})
-		if r, ok := meta[string([]byte{dbMetaMaxObjectStoreID})]; ok {
-			db.maxStoreID[d.Number] = truncatedInt(r.Value)
-		}
-
-		storePrefix := append(append([]byte{}, prefix...), objectStoreMetaByte)
-		names := map[uint64]string{}
-		_, storeMeta := db.newestLive(func(r *leveldb.Record) (string, bool) {
-			key := r.UserKey()
-			if !bytes.HasPrefix(key, storePrefix) {
-				return "", false
-			}
-			rest := key[len(storePrefix):]
-			id, n := leveldb.Uvarint(rest, 10)
-			if n == 0 || n >= len(rest) || rest[n] != objectStoreMetaName {
-				return "", false
-			}
-			return strconv.FormatUint(id, 10), true
-		})
-		for idText, r := range storeMeta {
-			id, err := strconv.ParseUint(idText, 10, 64)
-			if err != nil {
-				continue
-			}
-			if name, ok := utf16BE(r.Value); ok {
-				names[id] = name
-			}
-		}
-		db.storeNames[d.Number] = names
+		db.storeNames[d.Number] = map[uint64]string{}
 	}
+	for dbID, r := range maxStoreMeta {
+		if r.State == leveldb.Live {
+			if _, ok := db.storeNames[dbID]; ok {
+				db.maxStoreID[dbID] = truncatedInt(r.Value)
+			}
+		}
+	}
+	for addr, r := range storeNameMeta {
+		if r.State != leveldb.Live {
+			continue
+		}
+		names, ok := db.storeNames[addr.db]
+		if !ok {
+			continue
+		}
+		if name, ok := utf16BE(r.Value); ok {
+			names[addr.store] = name
+		}
+	}
+	for _, idxs := range storeIndex {
+		slices.Reverse(idxs)
+	}
+	db.storeIndex = storeIndex
+}
+
+func (db *DB) buildStoreIndex() {
+	index := map[storeAddr][]indexedRecord{}
+	for i := range db.records {
+		if db.ctx != nil && db.ctx.Err() != nil {
+			return
+		}
+		dbID, storeID, indexID, n, ok := readPrefix(db.records[i].UserKey())
+		if !ok || dbID == 0 || storeID == 0 || indexID != indexObjectStoreData {
+			continue
+		}
+		addr := storeAddr{db: dbID, store: storeID}
+		index[addr] = append(index[addr], indexedRecord{idx: i, prefixLen: n})
+	}
+	db.storeIndex = index
 }
 
 // ObjectStoreIDs returns the ids of the object stores whose name match

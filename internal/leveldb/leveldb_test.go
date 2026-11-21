@@ -369,3 +369,19 @@ func TestTableRecoveryKeepsBlocksAfterChecksumDamage(t *testing.T) {
 	assert.Equal(t, before[0].UserKey(), after[0].UserKey())
 	assert.Equal(t, before[len(before)-1].UserKey(), after[len(after)-1].UserKey())
 }
+
+func TestReadDirReturnsRootFileErrorInsteadOfCanceled(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	dir := t.TempDir()
+	writeFixture(t, dir)
+	bad := filepath.Join(dir, "999999.ldb")
+	require.NoError(t, os.WriteFile(bad, []byte("x"), 0o000))
+
+	_, _, err := ReadDir(context.Background(), dir, slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, context.Canceled)
+}

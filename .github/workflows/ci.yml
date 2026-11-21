@@ -52,7 +52,7 @@ jobs:
           GOOS: darwin
 
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go tool govulncheck ./...
 
   test-ubuntu:
     name: Tests (ubuntu)
@@ -70,6 +70,13 @@ jobs:
 
       - name: go test
         run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Check coverage
+        run: |
+          grep -v '/internal/idbtest/' coverage.out > coverage-prod.out
+          total=$(go tool cover -func=coverage-prod.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          echo "Total coverage (excluding idbtest): ${total}%"
+          awk -v cov="$total" 'BEGIN { exit (cov + 0 < 80 ? 1 : 0) }'
 
       - name: Upload coverage
         uses: actions/upload-artifact@v7

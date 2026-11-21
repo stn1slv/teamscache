@@ -269,3 +269,73 @@ func TestDeserializeStopsWhenCanceled(t *testing.T) {
 	})
 	require.ErrorIs(t, err, context.Canceled, "cancellation during decoding is not a bad-value error")
 }
+
+func TestBlinkCryptoKeys(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		data string
+		want CryptoKey
+	}{
+		{"aes", "ff0f 5c 4b 01 01 8001 05 02 01aa", CryptoKey{SubType: 1, Params: []uint64{1, 128}, Usages: 5, KeyData: []byte{0x01, 0xaa}}},
+		{"hmac", "ff0f 5c 4b 02 03 04 01 02 01bb", CryptoKey{SubType: 2, Params: []uint64{3, 4}, Usages: 1, KeyData: []byte{0x01, 0xbb}}},
+		{"rsa", "ff0f 5c 4b 04 07 01 8001 03 010001 05 02 02ccdd", CryptoKey{SubType: 4, Params: []uint64{7, 1, 128, 5}, Usages: 2, PublicExp: []byte{1, 0, 1}, KeyData: []byte{0xcc, 0xdd}}},
+		{"ec", "ff0f 5c 4b 05 09 02 01 03 01ee", CryptoKey{SubType: 5, Params: []uint64{9, 2, 1}, Usages: 3, KeyData: []byte{0xee}}},
+		{"no params", "ff0f 5c 4b 06 04 07 01ff", CryptoKey{SubType: 6, Params: []uint64{4}, Usages: 7, KeyData: []byte{0xff}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Deserialize(context.Background(), mustHex(t, tt.data), ReadBlinkHostObject)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+	for _, bad := range []string{"ff0f 5c 4b", "ff0f 5c 4b 7f", "ff0f 5c 4b 01 01"} {
+		_, err := Deserialize(context.Background(), mustHex(t, bad), ReadBlinkHostObject)
+		require.Error(t, err, bad)
+	}
+}
+
+func TestArrayBufferViewsAndErrorPaths(t *testing.T) {
+	t.Parallel()
+	// ArrayBuffer of 8 bytes followed by DataView ('?') and typed arrays.
+	views := []struct {
+		name string
+		data string
+		want []any
+	}{
+		{"int8", "ff0f 42 02 ff 01 56 62 00 02 00", []any{int64(-1), int64(1)}},
+		{"uint8", "ff0f 42 02 ff 01 56 42 00 02 00", []any{int64(255), int64(1)}},
+		{"uint8 clamped", "ff0f 42 01 80 56 43 00 01 00", []any{int64(128)}},
+		{"int16", "ff0f 42 02 fe ff 56 77 00 02 00", []any{int64(-2)}},
+		{"uint16", "ff0f 42 02 01 02 56 57 00 02 00", []any{int64(0x0201)}},
+		{"int32", "ff0f 42 04 fc ff ff ff 56 64 00 04 00", []any{int64(-4)}},
+		{"uint32", "ff0f 42 04 01 00 00 80 56 44 00 04 00", []any{int64(0x80000001)}},
+		{"float32", "ff0f 42 04 00 00 80 3f 56 66 00 04 00", []any{float64(1)}},
+		{"float64", "ff0f 42 08 00 00 00 00 00 00 f0 3f 56 46 00 08 00", []any{float64(1)}},
+		{"int64", "ff0f 42 08 fe ff ff ff ff ff ff ff 56 71 00 08 00", []any{int64(-2)}},
+		{"uint64", "ff0f 42 08 01 00 00 00 00 00 00 80 56 51 00 08 00", []any{new(big.Int).SetUint64((1 << 63) + 1)}},
+		{"dataview v13", "ff0d 42 02 0a 0b 56 3f 01 01", []any{int64(0x0b)}},
+	}
+	for _, tt := range views {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Deserialize(context.Background(), mustHex(t, tt.data), nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+	for _, bad := range []string{
+		"ff0f 49 02 56 42 00 00 00",       // view after non-buffer
+		"ff0f 42 01 00 56 42 00 02 00",    // outside buffer
+		"ff0f 42 02 00 00 56 77 00 01 00", // odd length for 2-byte int16
+		"ff0f 42 01 00 56 7e 00 01 00",    // unknown view subtag
+		"ff0f 5a 04 01",                   // truncated BigInt
+		"ff0f 52 49 02 00",                // RegExp with non-string pattern
+		"ff0f 52 22 01 61",                // RegExp missing flags
+	} {
+		_, err := Deserialize(context.Background(), mustHex(t, bad), nil)
+		require.Error(t, err, bad)
+	}
+}

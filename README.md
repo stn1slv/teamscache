@@ -32,12 +32,14 @@ You need a new Teams client that has been signed in at least once. Auto-discover
 
 ```bash
 teamscache accounts                      # tenant and user contexts in the cache
+teamscache profiles                      # discovered WebView2 cache profiles
 teamscache overview --days 7             # recent activity grouped by conversation
 teamscache recent --days 3               # messages of the last 3 days, newest first
 teamscache mentions --unread             # @-mentions of you that are not read yet
 teamscache search "quarterly budget"     # text in message content or sender name, newest first
 teamscache conversations                 # chats and channels
 teamscache read "19:abc@thread.v2"       # last messages of one conversation
+teamscache dump                          # accounts, conversations, messages and mentions in one JSON object
 ```
 
 All commands print JSON to stdout and a short summary to stderr, for example `# 12 result(s), 0 record(s) skipped, 0 damaged section(s)`. Skipped records could not be decoded. Damaged sections are unreadable file sections or missing referenced blob files, and are counted separately.
@@ -46,9 +48,10 @@ All commands print JSON to stdout and a short summary to stderr, for example `# 
 |------|----------|---------|
 | `--account <tenantId>:<userId>` | all | Only one account. The keys come from `teamscache accounts`. With `mcp`, every tool serves only this account. |
 | `--limit N` | most | Maximum number of results; `0` means no limit. |
-| `--days N` | `search`, `recent`, `mentions`, `overview` | Only items of the last N days; `0` means all. |
+| `--days N` | `search`, `recent`, `mentions`, `overview`, `dump` | Only items of the last N days; `0` means all. |
 | `--leveldb PATH` | all | Read this cache folder instead of the auto-discovered one. |
-| `--max-content N` | all | Characters of message content in mentions, the overview and MCP results; `0` means no limit (default 600). |
+| `--profile NAME` | all | Choose a discovered WebView2 profile by folder name (see `teamscache profiles`). |
+| `--max-content N` | all | Characters of message content in mentions, the overview, `dump` and MCP results; `0` means no limit (default 600). |
 | `-v`, `--verbose` | all | Log details, such as skipped records, to stderr. |
 
 Environment variables:
@@ -56,6 +59,7 @@ Environment variables:
 | Variable | Meaning |
 |----------|---------|
 | `TEAMSCACHE_LEVELDB` | Default for `--leveldb`. |
+| `TEAMSCACHE_PROFILE` | Default for `--profile`. |
 | `TEAMSCACHE_MAX_CONTENT` | Default for `--max-content`. |
 | `TEAMSCACHE_CACHE_TTL` | Seconds the MCP server reuses a parsed cache (default 180). |
 
