@@ -1,7 +1,6 @@
 package indexeddb
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -46,23 +45,27 @@ type Record struct {
 // order. A version whose value cannot be decoded is passed to onBad and
 // yielded with Err set. A key that cannot be decoded is only passed to onBad.
 func (db *DB) Records(dbNumber, storeID uint64, onBad func(error)) iter.Seq[Record] {
-	prefix := makePrefix(dbNumber, storeID, indexObjectStoreData)
+	if db.storeIndex == nil {
+		db.buildStoreIndex()
+	}
+	entries := db.storeIndex[storeAddr{db: dbNumber, store: storeID}]
 	return func(yield func(Record) bool) {
-		for i := range db.records {
+		for _, entry := range entries {
 			if db.ctx.Err() != nil {
 				return
 			}
-			r := &db.records[i]
+			r := &db.records[entry.idx]
 			userKey := r.UserKey()
-			if !bytes.HasPrefix(userKey, prefix) {
+			if len(userKey) < entry.prefixLen {
+				onBad(fmt.Errorf("%w: truncated record key", ErrBadValue))
 				continue
 			}
-			keyLen, err := idbKeyLength(userKey[len(prefix):], 0)
+			keyLen, err := idbKeyLength(userKey[entry.prefixLen:], 0)
 			if err != nil {
 				onBad(err)
 				continue
 			}
-			rec := Record{Key: userKey[len(prefix) : len(prefix)+keyLen], Live: r.State == leveldb.Live, Seq: r.Seq}
+			rec := Record{Key: userKey[entry.prefixLen : entry.prefixLen+keyLen], Live: r.State == leveldb.Live, Seq: r.Seq}
 			if len(r.Value) > 0 {
 				rec.Value, err = db.decodeValue(dbNumber, storeID, rec.Key, r.Value)
 				if err != nil {

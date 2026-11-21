@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -368,4 +370,24 @@ func TestTableRecoveryKeepsBlocksAfterChecksumDamage(t *testing.T) {
 	require.NotEmpty(t, after)
 	assert.Equal(t, before[0].UserKey(), after[0].UserKey())
 	assert.Equal(t, before[len(before)-1].UserKey(), after[len(after)-1].UserKey())
+}
+
+func TestReadDirReturnsRootFileErrorInsteadOfCanceled(t *testing.T) {
+	t.Parallel()
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("needs at least 2 workers")
+	}
+	rootErr := errors.New("disk read failed")
+	files := []dataFile{{path: "000001.ldb", number: 1}, {path: "000002.ldb", number: 2}}
+
+	_, err := parseFiles(context.Background(), files, func(ctx context.Context, f dataFile) fileResult {
+		if f.number == 1 {
+			<-ctx.Done()
+			return fileResult{err: ctx.Err()}
+		}
+		return fileResult{err: rootErr}
+	})
+
+	require.ErrorIs(t, err, rootErr)
+	assert.NotErrorIs(t, err, context.Canceled)
 }

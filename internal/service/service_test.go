@@ -122,7 +122,7 @@ func TestQueries(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, all, 2)
 		assert.Equal(t, "Plan", all[0].Conversation)
-		assert.Equal(t, "Budge", all[0].Content, "content is cut to MaxContent characters")
+		assert.Equal(t, "Budge…", all[0].Content, "content is cut to MaxContent characters")
 		assert.Equal(t, "c2", all[1].Conversation, "without a title, the id is shown")
 		all, err = snap.MentionsQuery(context.Background(), 0, true, "", 0, opts())
 		require.NoError(t, err)
@@ -139,12 +139,33 @@ func TestQueries(t *testing.T) {
 		assert.Equal(t, "c3", got[0].ConversationID)
 		assert.Equal(t, OverviewRow{
 			Conversation: "Plan", ConversationID: "c1", Count: 2, Senders: []string{"Ann (Org)", "Bob"},
-			LastSender: "Ann (Org)", LastMessage: "Budge", LastTime: ms(1), Account: "a",
+			LastSender: "Ann (Org)", LastMessage: "Budge…", LastTime: ms(1), Account: "a",
 		}, got[1], "the last message is cut to MaxContent characters")
 		got, err = snap.Overview(context.Background(), 0, "", opts())
 		require.NoError(t, err)
 		assert.Len(t, got, 3, "0 days means no cutoff")
 	})
+}
+
+func TestListConversationsSortsNewestFirstBeforeLimit(t *testing.T) {
+	t.Parallel()
+	snap := &Snapshot{Conversations: []teams.Conversation{
+		{Account: "a", ID: "old", Title: "Old", LastMessageTime: ms(10)},
+		{Account: "a", ID: "undated", Title: "Undated"},
+		{Account: "a", ID: "new", Title: "New", LastMessageTime: ms(1)},
+		{Account: "a", ID: "mid", Title: "Mid", LastMessageTime: ms(3)},
+	}}
+
+	got, err := snap.ListConversations(context.Background(), "", 2)
+
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, []string{"new", "mid"}, []string{got[0].ID, got[1].ID})
+
+	all, err := snap.ListConversations(context.Background(), "", 0)
+	require.NoError(t, err)
+	require.Len(t, all, 4)
+	assert.Equal(t, "undated", all[3].ID)
 }
 
 func TestTruncate(t *testing.T) {
@@ -153,7 +174,6 @@ func TestTruncate(t *testing.T) {
 	assert.Equal(t, "hé…", Truncate("héllo", 2))
 	assert.Equal(t, "héllo", Truncate("héllo", 0), "0 means no limit")
 	assert.Equal(t, "héllo", Truncate("héllo", -1), "a negative limit does not panic")
-	assert.Equal(t, "héllo", firstChars("héllo", -1))
 }
 
 func TestOptionsWithoutNow(t *testing.T) {
@@ -198,6 +218,7 @@ func TestEpochMillis(t *testing.T) {
 		{"2026-01-16T09:50:31.836Z", 1768557031836, true},
 		{"2026-01-16T09:50:31+00:00", 1768557031000, true},
 		{"2026-01-16 09:50:31.836000+00:00", 1768557031836, true}, // how dates are printed
+		{"  2026-01-16T09:50:31.836Z  ", 1768557031836, true},
 		{"", 0, false},
 		{"soon", 0, false},
 	}
@@ -225,6 +246,107 @@ func TestAccountLabels(t *testing.T) {
 		{Key: "t:u", TenantID: "t", UserID: "u", Label: "B Org"},
 		{Key: "x:y", TenantID: "x", UserID: "y", Label: ""},
 	}, got, "a tie goes to the label seen first, and repeated contexts are listed once")
+}
+
+func TestAccountsPreferProfilesOverMessageSuffixes(t *testing.T) {
+	t.Parallel()
+	accounts := []teams.Account{{TenantID: "t1", UserID: "u1"}, {TenantID: "t2", UserID: "u2"}}
+	profiles := []teams.Profile{
+		{Account: "t1:u1", TenantName: "Contoso", DisplayName: "Ann Lee", Email: "ann@contoso.test"},
+		{Account: "t2:u2", DisplayName: "Bob"}, // empty TenantName falls back to OrgLabel
+	}
+	messages := []teams.Message{
+		{Account: "t1:u1", Sender: "Guest (Other Org)"},
+		{Account: "t2:u2", Sender: "Bob (Fabrikam)"},
+	}
+
+	got := accountsWithProfiles(accounts, profiles, messages)
+
+	assert.Equal(t, []Account{
+		{Key: "t1:u1", TenantID: "t1", UserID: "u1", Label: "Contoso", TenantName: "Contoso", DisplayName: "Ann Lee", Email: "ann@contoso.test"},
+		{Key: "t2:u2", TenantID: "t2", UserID: "u2", Label: "Fabrikam", DisplayName: "Bob"},
+	}, got)
+}
+
+func TestLoadForAccountsUsesProfilesWithoutDecodingMessages(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, blobs := filepath.Join(root, "cache.leveldb"), filepath.Join(root, "cache.blob")
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	require.NoError(t, idbtest.Write(dir, blobs, []idbtest.Database{
+		{
+			Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+			Stores: []idbtest.Store{{Name: "replychains", Records: []idbtest.Record{
+				{Key: "bad", Value: "x", Wrapping: idbtest.Corrupt},
+				{Key: "blob", Value: idbtest.Obj{p("messageMap", idbtest.Obj{p("m", idbtest.Obj{p("content", "msg")})})}, Wrapping: idbtest.Blob},
+			}}},
+		},
+		{
+			Number: 2, Name: "Teams:profiles:react-web-client:t:u:en-us",
+			Stores: []idbtest.Store{{Name: "profiles", Records: []idbtest.Record{
+				{Key: "u", Value: idbtest.Obj{p("objectId", "u"), p("tenantName", "Contoso"), p("displayName", "Ann"), p("email", "ann@contoso.test")}},
+			}}},
+		},
+		{
+			Number: 3, Name: "Teams:conversation-manager:react-web-client:t:u:en-us",
+			Stores: []idbtest.Store{{Name: "conversations", Records: []idbtest.Record{
+				{Key: "c1", Value: idbtest.Obj{p("id", "c1"), p("threadProperties", idbtest.Obj{p("topic", "Project")})}},
+			}}},
+		},
+	}))
+	require.NoError(t, os.Remove(filepath.Join(blobs, "1", "00", "1")))
+
+	snap, err := LoadFor(context.Background(), dir, slog.New(slog.DiscardHandler), teams.ScopeProfiles)
+	require.NoError(t, err)
+	assert.Zero(t, snap.Skipped, "replychains is not decoded when profiles provides TenantName")
+	assert.Empty(t, snap.Damage, "missing message blobs are not copied when profiles provides TenantName")
+	assert.Empty(t, snap.Messages)
+	assert.Equal(t, []Account{{
+		Key: "t:u", TenantID: "t", UserID: "u", Label: "Contoso",
+		TenantName: "Contoso", DisplayName: "Ann", Email: "ann@contoso.test",
+	}}, snap.Accounts)
+
+	convSnap, err := LoadFor(context.Background(), dir, slog.New(slog.DiscardHandler), teams.ScopeConversations)
+	require.NoError(t, err)
+	assert.Zero(t, convSnap.Skipped, "conversations scope does not decode messages")
+	assert.Empty(t, convSnap.Damage, "conversations scope does not copy message blobs")
+	assert.Empty(t, convSnap.Messages)
+	require.Len(t, convSnap.Conversations, 1)
+}
+
+func TestDumpAndMessageRowIdentityFields(t *testing.T) {
+	t.Parallel()
+	sentTrue := true
+	snap := &Snapshot{
+		Accounts:      []Account{{Key: "a", TenantID: "t", UserID: "u", Label: "Org", TenantName: "Org"}},
+		Conversations: []teams.Conversation{{Account: "a", ID: "c1", Title: "Project", LastMessage: "long preview"}},
+		Messages: []teams.Message{
+			{Account: "a", ConversationID: "c1", MessageID: "m1", Sender: "Ann", Creator: "8:orgid:u", IsSentByCurrentUser: &sentTrue, Timestamp: ms(1), Content: "hello world"},
+			{Account: "b", ConversationID: "c2", MessageID: "m2", Sender: "Bob", Timestamp: ms(1), Content: "other tenant"},
+		},
+		Mentions: []teams.Mention{{Account: "a", ConversationID: "c1", MessageID: "m1", Timestamp: ms(1), IsRead: false}},
+	}
+
+	got, err := snap.Dump(context.Background(), 7, "a", opts())
+	require.NoError(t, err)
+	require.Len(t, got.Accounts, 1)
+	require.Len(t, got.Conversations, 1)
+	assert.Equal(t, "long …", got.Conversations[0].LastMessage)
+	require.Len(t, got.Messages, 1)
+	assert.Equal(t, "hello…", got.Messages[0].Content)
+	assert.Equal(t, "8:orgid:u", got.Messages[0].Creator)
+	require.NotNil(t, got.Messages[0].IsSentByCurrentUser)
+	assert.True(t, *got.Messages[0].IsSentByCurrentUser)
+	require.Len(t, got.Mentions, 1)
+	assert.False(t, got.Partial)
+	assert.NotNil(t, got.Damage)
+
+	rows, err := Rows(context.Background(), got.Messages, 0)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "8:orgid:u", rows[0].Creator)
+	require.NotNil(t, rows[0].IsSentByCurrentUser)
+	assert.True(t, *rows[0].IsSentByCurrentUser)
 }
 
 func TestCacheParsesAgainWhenTheFolderChanges(t *testing.T) {

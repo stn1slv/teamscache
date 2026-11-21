@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -172,7 +173,7 @@ func TestMessageFields(t *testing.T) {
 		"replyChainId", 1768557031836.0,
 		"messageMap", obj(
 			int64(42), obj("content", "<p>no id</p>", "imDisplayName", "", "from", "8:orgid:x", "composetime", "2026-01-16T09:50:31.836Z"),
-			"m2", obj("id", "m2", "content", "dated", "imDisplayName", "Ann", "originalArrivalTime", 1768557031836.0, "messageType", "RichText/Html"),
+			"m2", obj("id", "m2", "content", "dated", "imDisplayName", "Ann", "creator", "8:orgid:ann", "isSentByCurrentUser", true, "originalArrivalTime", 1768557031836.0, "messageType", "RichText/Html"),
 			"m3", obj("content", "   "),
 		),
 	)
@@ -182,10 +183,69 @@ func TestMessageFields(t *testing.T) {
 	require.Len(t, got, 2)
 	assert.Equal(t, Message{
 		Account: "t:u", ConversationID: "19:c@thread.v2", ReplyChainID: "1768557031836.0", MessageID: "42",
-		Sender: "8:orgid:x", Timestamp: "2026-01-16T09:50:31.836Z", Content: "no id", ContentType: "", Seq: 1,
+		Sender: "8:orgid:x", Creator: "8:orgid:x", Timestamp: "2026-01-16T09:50:31.836Z", Content: "no id", ContentType: "", Seq: 1,
 	}, got[0])
 	assert.Equal(t, "1768557031836.0", got[1].Timestamp)
 	assert.Equal(t, "RichText/Html", got[1].ContentType)
+	assert.Equal(t, "8:orgid:ann", got[1].Creator)
+	require.NotNil(t, got[1].IsSentByCurrentUser)
+	assert.True(t, *got[1].IsSentByCurrentUser)
+}
+
+func TestProfilesReturnsSignedInUserOnly(t *testing.T) {
+	t.Parallel()
+	stores := fakeRecords(
+		storeRecord{key: "colleague", seq: 1, live: true, value: obj(
+			"objectId", "other-user", "mri", "8:orgid:other-user", "tenantName", "Other Org", "displayName", "Bob", "email", "bob@example.test",
+		)},
+		storeRecord{key: "self-by-mri", seq: 2, live: true, value: obj(
+			"mri", "8:orgid:U", "tenantName", "Acme <Org>", "displayName", "Ann Lee", "userPrincipalName", "ann@acme.test",
+		)},
+		storeRecord{key: "self-by-id", seq: 3, live: true, value: obj(
+			"objectId", "U", "displayName", "Ann Lee Updated", "mail", "ann.lee@acme.test",
+		)},
+	)
+
+	got := profiles(stores, "")
+
+	require.Len(t, got, 1)
+	assert.Equal(t, Profile{
+		Account:     "t:u",
+		TenantName:  "Acme <Org>",
+		DisplayName: "Ann Lee Updated",
+		Email:       "ann.lee@acme.test",
+	}, got[0])
+	assert.Empty(t, profiles(stores, "other:account"))
+}
+
+func TestOpenForSkipsUnrelatedMissingBlobs(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, blobs := filepath.Join(root, "cache.leveldb"), filepath.Join(root, "cache.blob")
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	require.NoError(t, idbtest.Write(dir, blobs, []idbtest.Database{
+		{
+			Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+			Stores: []idbtest.Store{{Name: "replychains", Records: []idbtest.Record{
+				{Key: "r", Value: idbtest.Obj{p("messageMap", idbtest.Obj{p("m", idbtest.Obj{p("content", "ok")})})}},
+			}}},
+		},
+		{
+			Number: 2, Name: "Teams:user-installed-apps-manager:react-web-client:t:u:en-us",
+			Stores: []idbtest.Store{{Name: "user-app-definitions", Records: []idbtest.Record{
+				{Key: "app", Wrapping: idbtest.Blob, Value: idbtest.Obj{p("id", "app1")}},
+			}}},
+		},
+	}))
+	require.NoError(t, os.Remove(filepath.Join(blobs, "2", "00", "1")))
+
+	r, err := OpenFor(context.Background(), dir, slog.New(slog.DiscardHandler), ScopeMessages)
+
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+	assert.Empty(t, r.Damage())
+	assert.Zero(t, r.Skipped())
+	assert.Len(t, r.Messages(""), 1)
 }
 
 func TestPlainMessagesAndConversationPreviewsKeepMarkup(t *testing.T) {
@@ -382,8 +442,10 @@ func TestCopyDataFilesSkipsOtherFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(src, name), []byte("x"), 0o600))
 	}
 
-	require.NoError(t, copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler)))
+	stable, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
 
+	require.NoError(t, err)
+	assert.True(t, stable)
 	entries, err := os.ReadDir(dst)
 	require.NoError(t, err)
 	names := make([]string, 0, len(entries))
@@ -391,6 +453,67 @@ func TestCopyDataFilesSkipsOtherFiles(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	assert.Equal(t, []string{"000003.log", "000005.ldb"}, names)
+}
+
+func TestOpenAcceptsDotPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sample.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	t.Chdir(dir)
+
+	r, err := Open(context.Background(), ".", slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+	assert.Len(t, r.Messages(""), 2)
+}
+
+func TestProfileNameAndFindCacheForMissingProfile(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "WV2Profile_tfw", profileName(filepath.Join("EBWebView", "WV2Profile_tfw", "IndexedDB", leveldbName)))
+	_, err := FindCacheFor("no-such-profile-name-xyz")
+	require.ErrorIs(t, err, ErrCacheNotFound)
+}
+
+func TestDiscoverCachesAndFindCacheFor(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LOCALAPPDATA", home)
+
+	makeProfile := func(profile string, mod time.Time) string {
+		var dir string
+		switch runtime.GOOS {
+		case "darwin":
+			dir = filepath.Join(home, "Library", "Containers", "com.microsoft.teams2", "Data", "Library",
+				"Application Support", "Microsoft", "MSTeams", "EBWebView", profile, "IndexedDB", leveldbName)
+		case "windows":
+			dir = filepath.Join(home, "Packages", "MSTeams_test", "LocalCache", "Microsoft", "MSTeams",
+				"EBWebView", profile, "IndexedDB", leveldbName)
+		default:
+			dir = filepath.Join(home, ".config", "teams", profile, "IndexedDB", leveldbName)
+		}
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.Chtimes(dir, mod, mod))
+		return dir
+	}
+
+	older := makeProfile("WV2Profile_tfl", time.Now().Add(-time.Hour))
+	newer := makeProfile("WV2Profile_tfw", time.Now())
+
+	caches := DiscoverCaches()
+	require.Len(t, caches, 2)
+	assert.Equal(t, "WV2Profile_tfw", caches[0].Profile)
+	assert.Equal(t, newer, FindCache())
+
+	got, err := FindCacheFor("wv2profile_tfl")
+	require.NoError(t, err)
+	assert.Equal(t, older, got)
+
+	exact, err := matchProfile([]DiscoveredCache{
+		{Profile: "Default", Path: "/newer"},
+		{Profile: "default", Path: "/older"},
+	}, "default")
+	require.NoError(t, err)
+	assert.Equal(t, "/older", exact)
 }
 
 func TestBlobDirFor(t *testing.T) {

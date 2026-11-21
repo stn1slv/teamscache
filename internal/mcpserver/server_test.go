@@ -148,10 +148,54 @@ func TestNegativeLimitIsRejected(t *testing.T) {
 	t.Parallel()
 	session := connect(t, "")
 
-	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "recent_messages", Arguments: map[string]any{"limit": -1}})
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"recent_messages", map[string]any{"limit": -1}},
+		{"overview", map[string]any{"limit": -1}},
+	} {
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.name, Arguments: tc.args})
+		require.NoError(t, err)
+		assert.True(t, res.IsError, tc.name)
+	}
+}
 
-	require.NoError(t, err)
-	assert.True(t, res.IsError)
+func TestEmptyRequiredArgumentsAreRejected(t *testing.T) {
+	t.Parallel()
+	session := connect(t, "")
+
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"read_conversation", map[string]any{"conversation_id": "   "}},
+		{"search_messages", map[string]any{"query": "   "}},
+	} {
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.name, Arguments: tc.args})
+		require.NoError(t, err)
+		assert.True(t, res.IsError, tc.name)
+	}
+}
+
+func TestOverviewRespectsLimit(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	nowMs := float64(time.Now().UnixMilli())
+	require.NoError(t, idbtest.Write(dir, "", []idbtest.Database{{
+		Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+		Stores: []idbtest.Store{{Name: "replychains", Records: []idbtest.Record{
+			{Key: "r1", Value: idbtest.Obj{p("conversationId", "c1"), p("messageMap", idbtest.Obj{p("m1", idbtest.Obj{p("id", "m1"), p("content", "one"), p("originalArrivalTime", nowMs)})})}},
+			{Key: "r2", Value: idbtest.Obj{p("conversationId", "c2"), p("messageMap", idbtest.Obj{p("m2", idbtest.Obj{p("id", "m2"), p("content", "two"), p("originalArrivalTime", nowMs-1000)})})}},
+		}}},
+	}}))
+	session := connectCache(t, "", dir)
+
+	rows := callTool(t, session, "overview", map[string]any{"limit": 1})
+
+	require.Len(t, rows, 1)
+	assert.Equal(t, "c1", rows[0]["conversation_id"])
 }
 
 func TestEveryToolReportsPartialResults(t *testing.T) {

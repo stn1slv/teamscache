@@ -103,3 +103,109 @@ func TestAccountsHonorsTheAccountFlag(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, "[]", stdout)
 }
+
+func TestDumpCommand(t *testing.T) {
+	t.Parallel()
+	cache := sampleCache(t)
+
+	stdout, stderr, err := runCLI(t, "dump", "--leveldb", cache, "--max-content", "0")
+
+	require.NoError(t, err)
+	assert.Contains(t, stderr, "result(s)")
+	var got struct {
+		Accounts      []map[string]any `json:"accounts"`
+		Conversations []map[string]any `json:"conversations"`
+		Messages      []map[string]any `json:"messages"`
+		Mentions      []map[string]any `json:"mentions"`
+		Partial       bool             `json:"partial"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &got))
+	assert.Len(t, got.Accounts, 1)
+	assert.Len(t, got.Conversations, 1)
+	assert.Len(t, got.Messages, 2)
+	assert.Len(t, got.Mentions, 1)
+	assert.False(t, got.Partial)
+}
+
+func TestAccountsCommandReadsProfiles(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "profiles.leveldb")
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	require.NoError(t, idbtest.Write(dir, "", []idbtest.Database{
+		{
+			Number: 1, Name: "Teams:replychain-manager:react-web-client:t1:u1:en-us",
+			Stores: []idbtest.Store{{Name: "replychains"}},
+		},
+		{
+			Number: 2, Name: "Teams:profiles:react-web-client:t1:u1:en-us",
+			Stores: []idbtest.Store{{Name: "profiles", Records: []idbtest.Record{
+				{Key: "u1", Value: idbtest.Obj{
+					p("objectId", "u1"), p("tenantName", "Acme Corp"), p("displayName", "Ann Lee"), p("userPrincipalName", "ann@acme.test"),
+				}},
+			}}},
+		},
+	}))
+
+	stdout, _, err := runCLI(t, "accounts", "--leveldb", dir)
+
+	require.NoError(t, err)
+	var rows []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(stdout), &rows))
+	require.Len(t, rows, 1)
+	assert.Equal(t, "Acme Corp", rows[0]["label"])
+	assert.Equal(t, "Acme Corp", rows[0]["tenant_name"])
+	assert.Equal(t, "Ann Lee", rows[0]["display_name"])
+	assert.Equal(t, "ann@acme.test", rows[0]["email"])
+}
+
+func TestProfilesCommandAndProfileFlag(t *testing.T) {
+	t.Parallel()
+	stdout, stderr, err := runCLI(t, "profiles")
+
+	require.NoError(t, err)
+	assert.Contains(t, stderr, "profile(s)")
+	var rows []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(stdout), &rows))
+
+	_, _, err = runCLI(t, "accounts", "--leveldb", sampleCache(t), "--profile", "Default")
+	require.ErrorIs(t, err, ErrInvalidFlag)
+
+	_, _, err = runCLI(t, "accounts", "--profile", "no-such-profile-xyz")
+	require.Error(t, err)
+}
+
+func TestHelpAndEnvVarPrecedence(t *testing.T) {
+	cache := sampleCache(t)
+	t.Setenv(envProfile, "no-such-profile-xyz")
+
+	_, _, err := runCLI(t, "help")
+	require.NoError(t, err, "help does not resolve profiles")
+
+	stdout, _, err := runCLI(t, "accounts", "--leveldb", cache)
+	require.NoError(t, err, "explicit --leveldb overrides TEAMSCACHE_PROFILE")
+	assert.Contains(t, stdout, idbtest.SampleAccount)
+
+	t.Setenv(envLevelDB, cache)
+	_, _, err = runCLI(t, "accounts")
+	require.ErrorIs(t, err, ErrInvalidFlag, "both env vars set without CLI override fails")
+}
+
+func TestDumpCommandFiltersAccountAndDays(t *testing.T) {
+	t.Parallel()
+	cache := sampleCache(t)
+
+	stdout, _, err := runCLI(t, "dump", "--leveldb", cache, "--account", idbtest.SampleAccount, "--days", "7")
+
+	require.NoError(t, err)
+	var got struct {
+		Accounts      []map[string]any `json:"accounts"`
+		Conversations []map[string]any `json:"conversations"`
+		Messages      []map[string]any `json:"messages"`
+		Mentions      []map[string]any `json:"mentions"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &got))
+	assert.Len(t, got.Accounts, 1)
+	assert.Len(t, got.Conversations, 1)
+	assert.Len(t, got.Messages, 2)
+	assert.Len(t, got.Mentions, 1)
+}

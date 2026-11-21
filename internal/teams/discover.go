@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +11,13 @@ import (
 )
 
 const leveldbName = "https_teams.microsoft.com_0.indexeddb.leveldb"
+
+// DiscoveredCache is one Teams IndexedDB folder found on this computer.
+type DiscoveredCache struct {
+	Profile  string    `json:"profile"`
+	Path     string    `json:"path"`
+	Modified time.Time `json:"modified"`
+}
 
 // DefaultCacheGlobs returns the places where the new Teams client keeps its
 // IndexedDB LevelDB on this operating system.
@@ -33,12 +41,10 @@ func DefaultCacheGlobs() []string {
 	}
 }
 
-// FindCache returns the Teams LevelDB folder whose files changed last, or ""
-// when there is none. A client can have more than one WebView2 profile, and
-// the one in use is the one Teams writes to.
-func FindCache() string {
-	best := ""
-	var bestTime time.Time
+// DiscoverCaches returns all discovered Teams LevelDB folders, sorted from
+// newest modification time to oldest.
+func DiscoverCaches() []DiscoveredCache {
+	var found []DiscoveredCache
 	for _, pattern := range DefaultCacheGlobs() {
 		hits, _ := filepath.Glob(pattern)
 		sort.Strings(hits)
@@ -47,12 +53,53 @@ func FindCache() string {
 			if !ok {
 				continue
 			}
-			if best == "" || changed.After(bestTime) {
-				best, bestTime = hit, changed
-			}
+			found = append(found, DiscoveredCache{
+				Profile:  profileName(hit),
+				Path:     hit,
+				Modified: changed,
+			})
 		}
 	}
-	return best
+	sort.SliceStable(found, func(i, j int) bool {
+		return found[i].Modified.After(found[j].Modified)
+	})
+	return found
+}
+
+func profileName(leveldbDir string) string {
+	return filepath.Base(filepath.Dir(filepath.Dir(filepath.Clean(leveldbDir))))
+}
+
+// FindCache returns the Teams LevelDB folder whose files changed last, or ""
+// when there is none. A client can have more than one WebView2 profile, and
+// the one in use is the one Teams writes to.
+func FindCache() string {
+	caches := DiscoverCaches()
+	if len(caches) == 0 {
+		return ""
+	}
+	return caches[0].Path
+}
+
+// FindCacheFor returns the Teams LevelDB folder for the named WebView2 profile.
+func FindCacheFor(profile string) (string, error) {
+	return matchProfile(DiscoverCaches(), profile)
+}
+
+func matchProfile(caches []DiscoveredCache, profile string) (string, error) {
+	names := make([]string, 0, len(caches))
+	for _, c := range caches {
+		names = append(names, c.Profile)
+		if c.Profile == profile {
+			return c.Path, nil
+		}
+	}
+	for _, c := range caches {
+		if strings.EqualFold(c.Profile, profile) {
+			return c.Path, nil
+		}
+	}
+	return "", fmt.Errorf("%w: profile %q not found (available: %v)", ErrCacheNotFound, profile, names)
 }
 
 // lastChange returns the newest modification time of dir and its files.

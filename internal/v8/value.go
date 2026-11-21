@@ -28,7 +28,6 @@ import (
 	"math"
 	"math/big"
 	"strconv"
-	"time"
 )
 
 // Undefined is the JavaScript undefined value.
@@ -37,12 +36,6 @@ type Undefined struct{}
 // Date is a JavaScript Date, in milliseconds since the Unix epoch.
 type Date struct {
 	Millis float64
-}
-
-// Time returns the date as a UTC time.
-func (d Date) Time() time.Time {
-	sec, frac := math.Modf(d.Millis / 1000)
-	return time.Unix(int64(sec), int64(frac*1e9)).UTC()
 }
 
 // RegExp is a JavaScript regular expression.

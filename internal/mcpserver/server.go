@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -73,7 +74,8 @@ type unreadArgs struct {
 
 type overviewArgs struct {
 	accountArg
-	Days *int `json:"days,omitempty" jsonschema:"activity of the last N days (default 7)"`
+	Days  *int `json:"days,omitempty" jsonschema:"activity of the last N days (default 7)"`
+	Limit *int `json:"limit,omitempty" jsonschema:"maximum number of results (default 100)"`
 }
 
 // ErrInvalidArgument reports a tool argument the server does not accept.
@@ -152,7 +154,7 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 	}
 
 	mcp.AddTool(s, tool("list_accounts",
-		"List the Teams accounts (tenant and user contexts) in the local cache. Each has a key (use it as the account filter of the other tools), tenant_id, user_id and a best-effort label inferred from organization names in messages."),
+		"List the Teams accounts (tenant and user contexts) in the local cache. Each has a key (use it as the account filter of the other tools), tenant_id, user_id, and a label from the user's profile (tenant_name) or organization names in messages, plus optional display_name and email."),
 		func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, Result[service.Account], error) {
 			snap, account, err := srv.prepare(ctx, "", nil)
 			if err != nil {
@@ -185,7 +187,7 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 				if err := ctx.Err(); err != nil {
 					return nil, Result[teams.Conversation]{}, err
 				}
-				convs[i].LastMessage = service.Truncate(convs[i].LastMessage, opts.MaxContent)
+				convs[i].LastMessage = service.Truncate(convs[i].LastMessage, srv.opts.MaxContent)
 			}
 			return nil, result(snap, convs), ctx.Err()
 		})
@@ -193,6 +195,9 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 	mcp.AddTool(s, tool("read_conversation",
 		"Return the most recent messages of a conversation, oldest first."),
 		func(ctx context.Context, _ *mcp.CallToolRequest, in readConversationArgs) (*mcp.CallToolResult, Result[service.MessageRow], error) {
+			if strings.TrimSpace(in.ConversationID) == "" {
+				return nil, Result[service.MessageRow]{}, fmt.Errorf("%w: conversation_id is required", ErrInvalidArgument)
+			}
 			snap, account, err := srv.prepare(ctx, in.Account, in.Limit)
 			if err != nil {
 				return nil, Result[service.MessageRow]{}, err
@@ -207,6 +212,9 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 	mcp.AddTool(s, tool("search_messages",
 		"Search cached messages for text in the content or sender name, ignoring case. Optional days keeps only messages of the last N days."),
 		func(ctx context.Context, _ *mcp.CallToolRequest, in searchArgs) (*mcp.CallToolResult, Result[service.MessageRow], error) {
+			if strings.TrimSpace(in.Query) == "" {
+				return nil, Result[service.MessageRow]{}, fmt.Errorf("%w: query is required", ErrInvalidArgument)
+			}
 			d, err := days(in.Days, 0)
 			if err != nil {
 				return nil, Result[service.MessageRow]{}, err
@@ -283,13 +291,17 @@ func New(cache *service.Cache, opts service.Options, version, account string) *m
 			if err != nil {
 				return nil, Result[service.OverviewRow]{}, err
 			}
-			snap, account, err := srv.prepare(ctx, in.Account, nil)
+			snap, account, err := srv.prepare(ctx, in.Account, in.Limit)
 			if err != nil {
 				return nil, Result[service.OverviewRow]{}, err
 			}
 			rows, err := snap.Overview(ctx, d, account, opts)
 			if err != nil {
 				return nil, Result[service.OverviewRow]{}, err
+			}
+			limit := orDefault(in.Limit, 100)
+			if limit > 0 && len(rows) > limit {
+				rows = rows[:limit]
 			}
 			return nil, result(snap, rows), nil
 		})
