@@ -13,6 +13,7 @@
 package teams
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/stn1slv/teamscache/internal/indexeddb"
 	"github.com/stn1slv/teamscache/internal/leveldb"
@@ -109,16 +111,18 @@ type Mention struct {
 
 // Reader reads a Teams cache.
 type Reader struct {
-	db         *indexeddb.DB
-	tmp        string
-	sourcePath string
-	blobScope  Scope
-	skipped    int
-	damage     []leveldb.Damage
-	logger     *slog.Logger
+	db            *indexeddb.DB
+	tmp           string
+	sourcePath    string
+	blobScope     Scope
+	skipped       int
+	damage        []leveldb.Damage
+	dbDamageCount int
+	logger        *slog.Logger
 }
 
-// Scope selects which Teams stores Open copies external blobs for.
+// Scope selects which Teams stores OpenFor eagerly loads and copies external
+// blobs for.
 type Scope uint8
 
 // Store scopes.
@@ -155,21 +159,30 @@ func OpenFor(ctx context.Context, path string, logger *slog.Logger, scope Scope)
 	if err != nil {
 		return nil, fmt.Errorf("create temporary folder: %w", err)
 	}
-	r := &Reader{tmp: tmp, sourcePath: path, logger: logger}
+	r := &Reader{tmp: tmp, sourcePath: path, damage: []leveldb.Damage{}, logger: logger}
 	copyDir := filepath.Join(tmp, "leveldb")
-	stable, err := copyDataFiles(ctx, path, copyDir, logger)
+	copyRes, err := copyDataFiles(ctx, path, copyDir, logger)
 	if err != nil {
 		r.Close()
 		return nil, err
 	}
 	copyBlobDir := filepath.Join(tmp, "blobs")
-	r.db, err = indexeddb.Open(ctx, copyDir, copyBlobDir, logger)
+	r.db, err = indexeddb.OpenLive(ctx, copyDir, copyBlobDir, logger)
 	if err != nil {
 		r.Close()
 		return nil, err
 	}
-	r.damage = r.db.Damage()
-	if !stable {
+	r.syncDBDamage()
+	if copyRes.manifestErr != nil {
+		r.damage = append(r.damage, leveldb.Damage{
+			File:   "CURRENT",
+			Reason: copyRes.manifestErr.Error(),
+		})
+	}
+	if len(copyRes.manifestDamage) > 0 {
+		r.damage = append(r.damage, copyRes.manifestDamage...)
+	}
+	if !copyRes.stable {
 		r.damage = append(r.damage, leveldb.Damage{
 			File:   filepath.Base(filepath.Clean(path)),
 			Reason: "cache changed during copy; result can miss recent data",
@@ -186,7 +199,16 @@ func OpenFor(ctx context.Context, path string, logger *slog.Logger, scope Scope)
 	return r, nil
 }
 
-// EnsureBlobs copies external blobs needed by any newly requested stores in scope.
+func (r *Reader) syncDBDamage() {
+	all := r.db.Damage()
+	if len(all) > r.dbDamageCount {
+		r.damage = append(r.damage, all[r.dbDamageCount:]...)
+		r.dbDamageCount = len(all)
+	}
+}
+
+// EnsureBlobs loads stores and copies external blobs needed by any newly
+// requested stores in scope.
 func (r *Reader) EnsureBlobs(ctx context.Context, scope Scope) error {
 	missing := scope &^ r.blobScope
 	if missing == 0 {
@@ -196,6 +218,10 @@ func (r *Reader) EnsureBlobs(ctx context.Context, scope Scope) error {
 	if blobAccept == nil {
 		r.blobScope |= missing
 		return ctx.Err()
+	}
+	defer r.syncDBDamage()
+	if err := r.db.LoadStores(ctx, blobAccept); err != nil {
+		return err
 	}
 	copyBlobDir := filepath.Join(r.tmp, "blobs")
 	for _, file := range r.db.BlobFilesFor(blobAccept) {
@@ -275,71 +301,417 @@ func (r *Reader) Damage() []leveldb.Damage { return r.damage }
 
 // copyAttempts is how many times the copy is tried while Teams changes the
 // set of files, for example during a compaction.
-const copyAttempts = 3
+const (
+	copyAttempts    = 3
+	maxCurrentSize  = 4 << 10
+	maxManifestSize = leveldb.MaxDecodedSize
+)
 
-// copyDataFiles copies the LevelDB table and log files of src to dst. Other
-// files are not needed, and the LOCK file can be locked by the running client.
-// When the set of files changes during the copy, the copy starts again.
-func copyDataFiles(ctx context.Context, src, dst string, logger *slog.Logger) (bool, error) {
+var (
+	copyRetryDelay    = 25 * time.Millisecond
+	errNonRegularFile = errors.New("not a regular file")
+	errFileReplaced   = errors.New("file changed during open")
+	errFileTooLarge   = errors.New("file exceeds size limit")
+	// afterCopyFilesHook is an optional test hook invoked after copying files
+	// and before verifying snapshot stability.
+	afterCopyFilesHook func()
+)
+
+type copyResult struct {
+	stable         bool
+	raw            bool
+	manifestErr    error
+	staticManifest bool
+	manifestDamage []leveldb.Damage
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// copyDataFiles copies the active LevelDB files of src to dst. Other files are
+// not needed, and the LOCK file can be locked by the running client. When the
+// manifest or active tables change during the copy, the copy starts again.
+func copyDataFiles(ctx context.Context, src, dst string, logger *slog.Logger) (copyResult, error) {
 	for attempt := 1; ; attempt++ {
-		stable, err := copyOnce(ctx, src, dst)
-		if err != nil || stable {
-			return stable, err
+		res, err := copyOnce(ctx, src, dst, false)
+		if err != nil {
+			return copyResult{}, err
 		}
-		if attempt == copyAttempts {
-			logger.Warn("the cache changed during each copy; the result can miss recent data", "attempts", attempt)
-			return false, nil
+		if res.stable && res.manifestErr == nil && len(res.manifestDamage) == 0 {
+			return copyResult{stable: true, raw: res.raw}, nil
+		}
+		if res.staticManifest || attempt == copyAttempts {
+			if res.raw {
+				logger.Warn("the cache changed during each copy; the result can miss recent data", "attempts", attempt)
+				return copyResult{stable: res.stable, raw: true}, nil
+			}
+			// Fall back to copying all data files without CURRENT/MANIFEST so
+			// OpenLive scans every copied table instead of filtering by a stale
+			// or corrupt manifest.
+			rawRes, rawErr := copyRawWithRetries(ctx, src, dst)
+			if rawErr != nil {
+				return copyResult{}, rawErr
+			}
+			if res.manifestErr != nil {
+				logger.Warn("manifest unreadable during copy; fell back to copying all data files", "error", res.manifestErr)
+				return copyResult{stable: rawRes.stable, raw: true, manifestErr: res.manifestErr}, nil //nolint:nilerr // manifestErr is surfaced as damage while fallback succeeds
+			}
+			if len(res.manifestDamage) > 0 {
+				logger.Warn("manifest file check failed during copy; fell back to copying all data files", "issues", len(res.manifestDamage))
+				return copyResult{stable: rawRes.stable, raw: true, manifestDamage: res.manifestDamage}, nil
+			}
+			if !rawRes.stable {
+				logger.Warn("the cache changed during each copy; the result can miss recent data", "attempts", attempt)
+			}
+			return copyResult{stable: rawRes.stable, raw: true}, nil
 		}
 		if err := os.RemoveAll(dst); err != nil {
-			return false, fmt.Errorf("remove incomplete copy: %w", err)
+			return copyResult{}, fmt.Errorf("remove incomplete copy: %w", err)
+		}
+		if err := sleepContext(ctx, copyRetryDelay*time.Duration(attempt)); err != nil {
+			return copyResult{}, err
 		}
 	}
 }
 
-// copyOnce copies the data files once. It reports whether the set of files
-// was the same before and after the copy and no file disappeared.
-func copyOnce(ctx context.Context, src, dst string) (stable bool, err error) {
-	before, err := dataFiles(src)
+func copyRawWithRetries(ctx context.Context, src, dst string) (copyResult, error) {
+	for attempt := 1; ; attempt++ {
+		if err := os.RemoveAll(dst); err != nil {
+			return copyResult{}, fmt.Errorf("remove incomplete copy: %w", err)
+		}
+		res, err := copyRawOnce(ctx, src, dst, attempt < copyAttempts)
+		if err != nil {
+			return copyResult{}, err
+		}
+		if res.stable || attempt == copyAttempts {
+			return res, nil
+		}
+		if err := sleepContext(ctx, copyRetryDelay*time.Duration(attempt)); err != nil {
+			return copyResult{}, err
+		}
+	}
+}
+
+type fileStamp struct {
+	name    string
+	number  uint64
+	size    int64
+	modTime int64
+}
+
+func stampFile(dir, name string) (fileStamp, error) {
+	// #nosec G703 -- name is validated by leveldb.ValidateManifestName or is fixed ("CURRENT") before calling stampFile.
+	info, err := os.Lstat(filepath.Join(dir, name))
 	if err != nil {
-		return false, err
+		return fileStamp{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return fileStamp{}, fmt.Errorf("%s: %w", name, errNonRegularFile)
+	}
+	return fileStamp{name: name, size: info.Size(), modTime: info.ModTime().UnixNano()}, nil
+}
+
+// readRegularFile verifies path is a regular file (not a symlink or FIFO) within
+// maxBytes and reads it with context cancellation.
+func readRegularFile(ctx context.Context, path, name string, maxBytes int64) ([]byte, fileStamp, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fileStamp{}, err
+	}
+	// #nosec G703 -- caller validates name before joining with src directory.
+	linfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, fileStamp{}, err
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, fileStamp{}, fmt.Errorf("%s: %w", name, errNonRegularFile)
+	}
+	if linfo.Size() > maxBytes {
+		return nil, fileStamp{}, fmt.Errorf("%s: %w (%d bytes)", name, errFileTooLarge, linfo.Size())
+	}
+	f, err := openRegularNoFollow(path)
+	if err != nil {
+		if errors.Is(err, errNonRegularFile) {
+			return nil, fileStamp{}, fmt.Errorf("%s: %w", name, errNonRegularFile)
+		}
+		return nil, fileStamp{}, err
+	}
+	defer func() { _ = f.Close() }() // read-only, the read error is what matters
+	finfo, err := f.Stat()
+	if err != nil {
+		return nil, fileStamp{}, err
+	}
+	if !finfo.Mode().IsRegular() {
+		return nil, fileStamp{}, fmt.Errorf("%s: %w", name, errNonRegularFile)
+	}
+	if !os.SameFile(linfo, finfo) {
+		return nil, fileStamp{}, fmt.Errorf("%s: %w", name, errFileReplaced)
+	}
+	if finfo.Size() > maxBytes {
+		return nil, fileStamp{}, fmt.Errorf("%s: %w (%d bytes)", name, errFileTooLarge, finfo.Size())
+	}
+	data, err := io.ReadAll(io.LimitReader(leveldb.ContextReader{Context: ctx, Reader: f}, maxBytes+1))
+	if err != nil {
+		return nil, fileStamp{}, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fileStamp{}, fmt.Errorf("%s: %w", name, errFileTooLarge)
+	}
+	return data, fileStamp{name: name, size: finfo.Size(), modTime: finfo.ModTime().UnixNano()}, nil
+}
+
+// copyOnce copies the active LevelDB files once. When forceRaw is false and
+// src has a valid CURRENT and MANIFEST, it parses the manifest from the exact
+// bytes stamped and written to dst, verifies every manifest-listed table and
+// active/previous log is present with matching table sizes, and checks that
+// CURRENT, MANIFEST, and active tables stayed unchanged while copying active
+// .log files up to the true open-handle file size.
+func copyOnce(ctx context.Context, src, dst string, forceRaw bool) (copyResult, error) {
+	if err := ctx.Err(); err != nil {
+		return copyResult{}, err
+	}
+	if forceRaw {
+		return copyRawOnce(ctx, src, dst, false)
+	}
+
+	beforeCurrent, _, err := readRegularFile(ctx, filepath.Join(src, "CURRENT"), "CURRENT", maxCurrentSize)
+	if ctx.Err() != nil {
+		return copyResult{}, ctx.Err()
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return copyRawOnce(ctx, src, dst, true)
+	}
+	if errors.Is(err, errFileReplaced) {
+		return copyResult{stable: false}, nil
+	}
+	if err != nil {
+		return copyResult{
+			manifestErr:    fmt.Errorf("%w: read CURRENT: %w", leveldb.ErrCorrupt, err),
+			staticManifest: errors.Is(err, errNonRegularFile) || errors.Is(err, errFileTooLarge),
+		}, nil
+	}
+	manifestName := strings.TrimSpace(string(beforeCurrent))
+	if valErr := leveldb.ValidateManifestName(manifestName); valErr != nil {
+		return copyResult{manifestErr: valErr, staticManifest: true}, nil //nolint:nilerr // manifest errors trigger raw fallback
+	}
+	manifestBytes, beforeManifest, readErr := readRegularFile(ctx, filepath.Join(src, manifestName), manifestName, maxManifestSize)
+	if ctx.Err() != nil {
+		return copyResult{}, ctx.Err()
+	}
+	if errors.Is(readErr, errFileReplaced) {
+		return copyResult{stable: false}, nil
+	}
+	if readErr != nil {
+		if errors.Is(readErr, fs.ErrNotExist) {
+			return copyResult{manifestErr: fmt.Errorf("%w: manifest %s referenced by CURRENT is missing", leveldb.ErrCorrupt, manifestName)}, nil
+		}
+		return copyResult{
+			manifestErr:    fmt.Errorf("%w: read manifest %s: %w", leveldb.ErrCorrupt, manifestName, readErr),
+			staticManifest: errors.Is(readErr, errNonRegularFile) || errors.Is(readErr, errFileTooLarge),
+		}, nil
+	}
+	if int64(len(manifestBytes)) != beforeManifest.size {
+		// Manifest changed while reading it; retry.
+		return copyResult{stable: false}, nil
+	}
+	manifest, parseErr := leveldb.ParseManifest(ctx, manifestName, manifestBytes)
+	if ctx.Err() != nil {
+		return copyResult{}, ctx.Err()
+	}
+	if parseErr != nil {
+		return copyResult{manifestErr: parseErr}, nil //nolint:nilerr // manifest errors trigger retry and raw fallback
+	}
+
+	beforeTables, beforeLogs, err := scanDataFiles(src, manifest)
+	if err != nil {
+		return copyResult{}, err
+	}
+	if manifestDamage := validateManifestStamps(manifest, beforeTables, beforeLogs); len(manifestDamage) > 0 {
+		return copyResult{manifestDamage: manifestDamage}, nil
+	}
+
+	if err := os.Mkdir(dst, 0o700); err != nil {
+		return copyResult{}, fmt.Errorf("create copy folder: %w", err)
+	}
+	// #nosec G703 -- dst is created inside os.MkdirTemp and CURRENT is a fixed filename.
+	if err := os.WriteFile(filepath.Join(dst, "CURRENT"), beforeCurrent, 0o600); err != nil {
+		return copyResult{}, fmt.Errorf("write CURRENT copy: %w", err)
+	}
+	// #nosec G703 -- dst is inside os.MkdirTemp and manifestName passed leveldb.ValidateManifestName.
+	if err := os.WriteFile(filepath.Join(dst, manifestName), manifestBytes, 0o600); err != nil {
+		return copyResult{}, fmt.Errorf("write manifest copy: %w", err)
+	}
+
+	for _, f := range beforeTables {
+		if err := ctx.Err(); err != nil {
+			return copyResult{}, err
+		}
+		err := copyFile(ctx, filepath.Join(src, f.name), filepath.Join(dst, f.name), 0)
+		if errors.Is(err, fs.ErrNotExist) {
+			return copyResult{stable: false}, nil
+		}
+		if err != nil {
+			return copyResult{}, err
+		}
+	}
+	for _, f := range beforeLogs {
+		if err := ctx.Err(); err != nil {
+			return copyResult{}, err
+		}
+		torn, copyErr := copyLogPrefix(ctx, filepath.Join(src, f.name), filepath.Join(dst, f.name), true)
+		if errors.Is(copyErr, fs.ErrNotExist) || (copyErr == nil && torn) {
+			return copyResult{stable: false}, nil
+		}
+		if copyErr != nil {
+			return copyResult{}, copyErr
+		}
+	}
+	if afterCopyFilesHook != nil {
+		afterCopyFilesHook()
+	}
+
+	afterCurrent, _, curErr := readRegularFile(ctx, filepath.Join(src, "CURRENT"), "CURRENT", maxCurrentSize)
+	if ctx.Err() != nil {
+		return copyResult{}, ctx.Err()
+	}
+	if curErr != nil || !bytes.Equal(beforeCurrent, afterCurrent) {
+		return copyResult{stable: false}, nil //nolint:nilerr // post-copy verification errors trigger retry and fallback
+	}
+	afterManifest, mErr := stampFile(src, manifestName)
+	if mErr != nil || beforeManifest != afterManifest {
+		return copyResult{stable: false}, nil //nolint:nilerr // post-copy verification errors trigger retry and fallback
+	}
+	afterTables, afterLogs, err := scanDataFiles(src, manifest)
+	if err != nil {
+		return copyResult{}, err
+	}
+	ok := slices.Equal(beforeTables, afterTables) && logsStable(beforeLogs, afterLogs)
+	return copyResult{stable: ok}, nil
+}
+
+func copyRawOnce(ctx context.Context, src, dst string, checkTornLog bool) (copyResult, error) {
+	beforeTables, beforeLogs, err := scanDataFiles(src, nil)
+	if err != nil {
+		return copyResult{}, err
 	}
 	if err := os.Mkdir(dst, 0o700); err != nil {
-		return false, fmt.Errorf("create copy folder: %w", err)
+		return copyResult{}, fmt.Errorf("create copy folder: %w", err)
 	}
-	stable = true
-	for _, name := range before {
+	stable := true
+	for _, f := range beforeTables {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return copyResult{}, err
 		}
-		err := copyFile(ctx, filepath.Join(src, name), filepath.Join(dst, name), 0)
+		err := copyFile(ctx, filepath.Join(src, f.name), filepath.Join(dst, f.name), 0)
 		if errors.Is(err, fs.ErrNotExist) {
 			stable = false
 			continue
 		}
 		if err != nil {
-			return false, err
+			return copyResult{}, err
 		}
 	}
-	after, err := dataFiles(src)
-	if err != nil {
-		return false, err
+	for _, f := range beforeLogs {
+		if err := ctx.Err(); err != nil {
+			return copyResult{}, err
+		}
+		torn, copyErr := copyLogPrefix(ctx, filepath.Join(src, f.name), filepath.Join(dst, f.name), checkTornLog)
+		if errors.Is(copyErr, fs.ErrNotExist) {
+			stable = false
+			continue
+		}
+		if copyErr != nil {
+			return copyResult{}, copyErr
+		}
+		if torn {
+			stable = false
+		}
 	}
-	return stable && slices.Equal(before, after), nil
+	if afterCopyFilesHook != nil {
+		afterCopyFilesHook()
+	}
+	afterTables, afterLogs, err := scanDataFiles(src, nil)
+	if err != nil {
+		return copyResult{}, err
+	}
+	ok := stable && slices.Equal(beforeTables, afterTables) && logsStable(beforeLogs, afterLogs)
+	return copyResult{stable: ok, raw: true}, nil
 }
 
-// dataFiles returns the sorted names of the LevelDB data files in dir.
-func dataFiles(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("read cache folder: %w", err)
+func validateManifestStamps(manifest *leveldb.Manifest, tables, logs []fileStamp) []leveldb.Damage {
+	entries := make([]leveldb.FileEntry, 0, len(tables)+len(logs))
+	for _, t := range tables {
+		entries = append(entries, leveldb.FileEntry{Name: t.name, Number: t.number, IsLog: false, Size: t.size})
 	}
-	var names []string
-	for _, e := range entries {
-		if e.Type().IsRegular() && leveldb.IsDataFile(e.Name()) {
-			names = append(names, e.Name())
+	for _, l := range logs {
+		entries = append(entries, leveldb.FileEntry{Name: l.name, Number: l.number, IsLog: true, Size: l.size})
+	}
+	return leveldb.ValidateManifestEntries(manifest, entries)
+}
+
+// logsStable reports whether the set of log files kept the same names and no
+// log file shrank. Normal appends to an active write-ahead log are allowed.
+func logsStable(before, after []fileStamp) bool {
+	if len(before) != len(after) {
+		return false
+	}
+	for i := range before {
+		if before[i].name != after[i].name || after[i].size < before[i].size {
+			return false
 		}
 	}
-	return names, nil
+	return true
+}
+
+// scanDataFiles returns sorted file stamps for tables and logs in dir.
+// When manifest is non-nil, only active tables and active logs are included.
+func scanDataFiles(dir string, manifest *leveldb.Manifest) (tables, logs []fileStamp, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read cache folder: %w", err)
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		name := e.Name()
+		number, isLog, ok := leveldb.ParseFileNumber(name)
+		if !ok {
+			continue
+		}
+		if manifest != nil {
+			if isLog && !manifest.IsActiveLog(number) {
+				continue
+			}
+			if !isLog && !manifest.IsActiveTable(number) {
+				continue
+			}
+		}
+		info, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("stat cache file %s: %w", name, err)
+		}
+		stamp := fileStamp{name: name, number: number, size: info.Size(), modTime: info.ModTime().UnixNano()}
+		if isLog {
+			logs = append(logs, stamp)
+		} else {
+			tables = append(tables, stamp)
+		}
+	}
+	return tables, logs, nil
 }
 
 // copyFile copies a file. A positive limit caps the bytes written, including
@@ -393,6 +765,53 @@ func copyFile(ctx context.Context, src, dst string, limit int64) error {
 		return fmt.Errorf("copy cache file: %w", err)
 	}
 	return nil
+}
+
+// copyLogPrefix opens src, reads its true current size from the open file
+// handle (avoiding stale Windows NTFS directory-entry sizes for open logs),
+// copies that prefix to dst, and optionally checks whether the copied bytes
+// end mid-record so the caller can retry while a write is in flight.
+func copyLogPrefix(ctx context.Context, src, dst string, checkTorn bool) (torn bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return false, &sourceReadError{err: err}
+	}
+	defer func() { _ = in.Close() }() // read-only, a close error changes nothing
+	info, err := in.Stat()
+	if err != nil {
+		return false, &sourceReadError{err: err}
+	}
+	prefixBytes := max(info.Size(), 0)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return false, fmt.Errorf("copy cache file: %w", err)
+	}
+	reader := leveldb.ContextReader{Context: ctx, Reader: sourceReader{reader: in}}
+	var copied int64
+	if checkTorn && prefixBytes > 0 && prefixBytes <= 32<<20 {
+		var buf bytes.Buffer
+		buf.Grow(int(min(prefixBytes, 64<<10)))
+		copied, err = io.Copy(io.MultiWriter(out, &buf), io.LimitReader(reader, prefixBytes))
+		if err == nil && copied == prefixBytes {
+			torn, err = leveldb.HasIncompleteLogTail(ctx, buf.Bytes())
+		}
+	} else {
+		copied, err = io.Copy(out, io.LimitReader(reader, prefixBytes))
+	}
+	if err != nil {
+		_ = out.Close() // the copy error is the one to report
+		if removeErr := os.Remove(dst); removeErr != nil {
+			return false, fmt.Errorf("remove incomplete copy: %w", removeErr)
+		}
+		return false, fmt.Errorf("copy cache file: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return false, fmt.Errorf("copy cache file: %w", err)
+	}
+	return torn || copied < prefixBytes, nil
 }
 
 // storeRecord is one version of an object store record.
@@ -487,10 +906,13 @@ func isStore(name, store string) bool {
 	return true
 }
 
-// records yields every record version of one object store.
+// records yields the newest live (or failed winning) version of each key in
+// one object store. Downstream latest/current still retain storeRecord.live for
+// multi-store merging and fakeRecords unit tests.
 func (r *Reader) records(dbNumber, storeID uint64) iter.Seq[storeRecord] {
 	return func(yield func(storeRecord) bool) {
-		for rec := range r.db.Records(dbNumber, storeID, r.onBad) {
+		defer r.syncDBDamage()
+		for rec := range r.db.CurrentRecords(dbNumber, storeID, r.onBad) {
 			if !yield(storeRecord{key: string(rec.Key), seq: rec.Seq, live: rec.Live, value: rec.Value, failed: rec.Err != nil, store: storeID}) {
 				return
 			}

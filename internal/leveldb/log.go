@@ -124,12 +124,35 @@ func readLogBatches(ctx context.Context, data []byte) ([]logBatch, []logDamage, 
 	return batches, damage, nil
 }
 
+// HasIncompleteLogTail reports whether data ends with a truncated log fragment
+// or an unterminated multi-fragment record.
+func HasIncompleteLogTail(ctx context.Context, data []byte) (bool, error) {
+	if len(data) == 0 {
+		return false, ctx.Err()
+	}
+	_, damage, err := readLogBatches(ctx, data)
+	if err != nil {
+		return false, err
+	}
+	end := int64(len(data))
+	for _, d := range damage {
+		if d.offset+d.length == end && d.reason == "incomplete record at the end of the file" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // parseLog returns the records of a .log file and the stretches it skipped.
 //
 // A write batch is: sequence (8 bytes), count (4 bytes), then count entries of
 // type (1 byte), varint-prefixed key and, for live entries, varint-prefixed
 // value. Entry i of a batch gets sequence number seq+i.
 func parseLog(ctx context.Context, data []byte, path string) ([]Record, []logDamage, error) {
+	return parseLogFiltered(ctx, data, path, nil)
+}
+
+func parseLogFiltered(ctx context.Context, data []byte, path string, keepRecord func([]byte) bool) ([]Record, []logDamage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -161,6 +184,9 @@ func parseLog(ctx context.Context, data []byte, path string) ([]Record, []logDam
 				break
 			}
 			pos += n
+			if keepRecord != nil && !keepRecord(key) {
+				continue
+			}
 			records = append(records, Record{
 				Key: key, Value: value, Seq: seq + uint64(i), State: state,
 				FileType: Log, File: path, Offset: b.offset + int64(start),

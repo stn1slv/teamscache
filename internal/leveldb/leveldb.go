@@ -111,6 +111,19 @@ func IsDataFile(name string) bool {
 	return dataFilePattern.MatchString(name)
 }
 
+// ParseFileNumber parses the decimal number and kind of a LevelDB data file.
+func ParseFileNumber(name string) (number uint64, isLog, ok bool) {
+	if !IsDataFile(name) {
+		return 0, false, false
+	}
+	stem := strings.TrimSuffix(name, filepath.Ext(name))
+	number, err := strconv.ParseUint(stem, 10, 64)
+	if err != nil {
+		return 0, false, false
+	}
+	return number, strings.HasSuffix(name, ".log"), true
+}
+
 type dataFile struct {
 	path   string
 	number uint64
@@ -136,13 +149,35 @@ type fileResult struct {
 	err      error
 }
 
-func parseDataFile(ctx context.Context, f dataFile) fileResult {
+// ReadOptions controls which files, table blocks, and records ReadDirOptions
+// reads. Nil callbacks accept everything. KeepFile is called sequentially on
+// the calling goroutine before worker goroutines start. KeepBlock and
+// KeepRecord may be called concurrently from multiple worker goroutines and
+// must be safe for concurrent use.
+type ReadOptions struct {
+	// KeepFile reports whether a data file should be read. It runs
+	// sequentially during directory scanning before any file is opened.
+	KeepFile func(number uint64, isLog bool) bool
+	// KeepBlock reports whether a table data block should be decompressed and
+	// decoded. prevUserKey is nil for the first block of a table; otherwise it
+	// is the user key of the previous index entry. userKey is the user key of
+	// the current index entry. Under the table's comparator, every key in the
+	// block lies in [prevUserKey, userKey].
+	KeepBlock func(prevUserKey, userKey []byte) bool
+	// KeepRecord reports whether a decoded record should be retained.
+	KeepRecord func(userKey []byte) bool
+}
+
+func parseDataFile(ctx context.Context, f dataFile, opts ReadOptions) fileResult {
+	if !f.isLog && opts.KeepBlock != nil {
+		return parseTableFileSelective(ctx, f.path, opts)
+	}
 	data, err := readFile(ctx, f.path)
 	if err != nil {
 		return fileResult{err: fmt.Errorf("read %s: %w", f.path, err)}
 	}
 	if f.isLog {
-		recs, sections, err := parseLog(ctx, data, f.path)
+		recs, sections, err := parseLogFiltered(ctx, data, f.path, opts.KeepRecord)
 		if err != nil {
 			return fileResult{err: err}
 		}
@@ -157,7 +192,28 @@ func parseDataFile(ctx context.Context, f dataFile) fileResult {
 		}
 		return res
 	}
-	recs, sections, err := parseTable(ctx, data, f.path)
+	recs, sections, err := parseTableFiltered(ctx, data, f.path, opts)
+	return tableFileResult(ctx, f.path, int64(len(data)), recs, sections, err)
+}
+
+func parseTableFileSelective(ctx context.Context, path string, opts ReadOptions) fileResult {
+	file, err := os.Open(path)
+	if err != nil {
+		return fileResult{err: fmt.Errorf("read %s: %w", path, err)}
+	}
+	defer func() { _ = file.Close() }() // read-only, the read error is what matters
+	info, err := file.Stat()
+	if err != nil {
+		return fileResult{err: fmt.Errorf("read %s: %w", path, err)}
+	}
+	recs, sections, parseErr := parseTableAt(ctx, file, info.Size(), path, opts)
+	if parseErr != nil && !errors.Is(parseErr, ErrCorrupt) && ctx.Err() == nil {
+		return fileResult{err: fmt.Errorf("read %s: %w", path, parseErr)}
+	}
+	return tableFileResult(ctx, path, info.Size(), recs, sections, parseErr)
+}
+
+func tableFileResult(ctx context.Context, path string, size int64, recs []Record, sections []Damage, err error) fileResult {
 	if ctx.Err() != nil {
 		return fileResult{err: ctx.Err()}
 	}
@@ -166,12 +222,12 @@ func parseDataFile(ctx context.Context, f dataFile) fileResult {
 	if err != nil {
 		res.warnings = append(res.warnings, fileWarning{
 			msg:  "skipped the unreadable part of a table file",
-			args: []any{"file", f.path, "records_read", len(recs), "error", err},
+			args: []any{"file", path, "records_read", len(recs), "error", err},
 		})
-		res.damage = append(res.damage, Damage{File: filepath.Base(f.path), Length: int64(len(data)), Reason: err.Error()})
+		res.damage = append(res.damage, Damage{File: filepath.Base(path), Length: size, Reason: err.Error()})
 	}
 	for _, section := range sections {
-		res.warnings = append(res.warnings, sectionWarning("skipped damaged table data", f.path, section.Offset, section.Length, section.Reason))
+		res.warnings = append(res.warnings, sectionWarning("skipped damaged table data", path, section.Offset, section.Length, section.Reason))
 	}
 	res.damage = append(res.damage, sections...)
 	return res
@@ -229,6 +285,12 @@ func parseFiles(ctx context.Context, files []dataFile, parse func(context.Contex
 // does not hide the rest of the data.
 // It stops with the context's error when ctx is canceled.
 func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, []Damage, error) {
+	return ReadDirOptions(ctx, dir, logger, ReadOptions{})
+}
+
+// ReadDirOptions works like ReadDir, applying opts to filter files, table
+// blocks, and records.
+func ReadDirOptions(ctx context.Context, dir string, logger *slog.Logger, opts ReadOptions) ([]Record, []Damage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -237,30 +299,55 @@ func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, []
 		return nil, nil, fmt.Errorf("read leveldb directory: %w", err)
 	}
 	var files []dataFile
+	var dupDamage []Damage
+	tableIdx := map[uint64]int{}
 	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
 		name := e.Name()
-		if !e.Type().IsRegular() || !IsDataFile(name) {
+		number, isLog, ok := ParseFileNumber(name)
+		if !ok {
 			continue
 		}
-		stem := strings.TrimSuffix(name, filepath.Ext(name))
-		number, err := strconv.ParseUint(stem, 10, 64)
-		if err != nil {
+		if opts.KeepFile != nil && !opts.KeepFile(number, isLog) {
 			continue
 		}
-		files = append(files, dataFile{
+		df := dataFile{
 			path:   filepath.Join(dir, name),
 			number: number,
-			isLog:  strings.HasSuffix(name, ".log"),
-		})
+			isLog:  isLog,
+		}
+		if !isLog {
+			if prev, exists := tableIdx[number]; exists {
+				// LevelDB prefers .ldb over legacy .sst when both share a file number.
+				if strings.HasSuffix(name, ".ldb") && !strings.HasSuffix(files[prev].path, ".ldb") {
+					dupName := filepath.Base(files[prev].path)
+					logger.Warn("duplicate table file number; skipped legacy .sst in favor of .ldb", "file", dupName, "kept", name)
+					dupDamage = append(dupDamage, Damage{File: dupName, Reason: "duplicate table file number; skipped in favor of " + name})
+					files[prev] = df
+				} else {
+					keptName := filepath.Base(files[prev].path)
+					logger.Warn("duplicate table file number; skipped duplicate table", "file", name, "kept", keptName)
+					dupDamage = append(dupDamage, Damage{File: name, Reason: "duplicate table file number; skipped in favor of " + keptName})
+				}
+				continue
+			}
+			tableIdx[number] = len(files)
+		}
+		files = append(files, df)
 	}
 	sort.SliceStable(files, func(i, j int) bool { return files[i].number < files[j].number })
 
-	results, err := parseFiles(ctx, files, parseDataFile)
+	results, err := parseFiles(ctx, files, func(ctx context.Context, f dataFile) fileResult {
+		return parseDataFile(ctx, f, opts)
+	})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	var totalRecords, totalDamage int
+	var totalRecords int
+	totalDamage := len(dupDamage)
 	for i := range results {
 		if results[i].err != nil {
 			return nil, nil, results[i].err
@@ -270,6 +357,7 @@ func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, []
 	}
 	records := make([]Record, 0, totalRecords)
 	damage := make([]Damage, 0, totalDamage)
+	damage = append(damage, dupDamage...)
 	for i := range results {
 		for _, w := range results[i].warnings {
 			logger.Warn(w.msg, w.args...)

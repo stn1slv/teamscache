@@ -402,14 +402,38 @@ func TestLoadReportsDamagedSections(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "cache.leveldb")
 	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "999999.ldb"), []byte("corrupt"), 0o600))
+	// Corrupt the tail of the active log file so the live dataset has a damaged section.
+	logs, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	require.NoError(t, err)
+	require.NotEmpty(t, logs)
+	activeLog := logs[len(logs)-1]
+	raw, err := os.ReadFile(activeLog)
+	require.NoError(t, err)
+	// Append non-zero garbage so the tail is reported as damaged rather than zero-fill.
+	raw = append(raw, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+	// #nosec G703 -- activeLog comes from filepath.Glob inside t.TempDir.
+	require.NoError(t, os.WriteFile(activeLog, raw, 0o600))
 
 	snap, err := Load(context.Background(), dir, slog.New(slog.DiscardHandler))
 
 	require.NoError(t, err)
 	require.Len(t, snap.Damage, 1)
-	assert.Equal(t, "999999.ldb", snap.Damage[0].File)
+	assert.Equal(t, filepath.Base(activeLog), snap.Damage[0].File)
 	assert.Zero(t, snap.Skipped, "file damage is counted separately from undecodable records")
+	assert.Len(t, snap.Messages, 2)
+}
+
+func TestLoadIgnoresObsoleteUnreferencedTable(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "999999.ldb"), []byte("corrupt"), 0o600))
+
+	snap, err := Load(context.Background(), dir, slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	assert.Empty(t, snap.Damage, "obsolete table not referenced by CURRENT/MANIFEST is ignored")
+	assert.Zero(t, snap.Skipped)
 	assert.Len(t, snap.Messages, 2)
 }
 
