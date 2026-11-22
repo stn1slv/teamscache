@@ -13,8 +13,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
 	"slices"
 	"sort"
 	"unicode/utf16"
@@ -49,7 +51,8 @@ type indexedRecord struct {
 	prefixLen int
 }
 
-// DB is an IndexedDB LevelDB, read into memory.
+// DB is an IndexedDB LevelDB, read into memory. The context passed to Open or
+// OpenLive governs cancellation for all subsequent reads on the DB.
 type DB struct {
 	ctx          context.Context
 	dir          string
@@ -57,6 +60,7 @@ type DB struct {
 	manifest     *leveldb.Manifest
 	lazyStores   bool
 	loadedStores map[storeAddr]bool
+	logRecords   []leveldb.Record
 	damage       []leveldb.Damage
 	damageSeen   map[leveldb.Damage]bool
 	records      []leveldb.Record
@@ -68,10 +72,12 @@ type DB struct {
 	storeNames  map[uint64]map[uint64]string
 	storeIndex  map[storeAddr][]indexedRecord
 	blobEntries map[recordKey]blobEntry
+	blobSeq     map[recordKey]uint64
 }
 
 // Open reads all records of the LevelDB in dir. blobDir is the folder that
-// holds values too large for LevelDB; it may be empty.
+// holds values too large for LevelDB; it may be empty. The provided ctx governs
+// cancellation for Open and subsequent reads on the returned DB.
 func Open(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, error) {
 	records, damage, err := leveldb.ReadDir(ctx, dir, logger)
 	if err != nil {
@@ -86,11 +92,42 @@ func Open(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, e
 	return db, nil
 }
 
+// missingManifestTables returns sorted table file numbers listed in manifest
+// that are not present as regular .ldb or .sst files in dir.
+func missingManifestTables(dir string, manifest *leveldb.Manifest) ([]uint64, error) {
+	if len(manifest.Tables) == 0 {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read leveldb directory: %w", err)
+	}
+	present := make(map[uint64]bool, len(entries))
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		if num, isLog, ok := leveldb.ParseFileNumber(e.Name()); ok && !isLog {
+			present[num] = true
+		}
+	}
+	var missing []uint64
+	for num := range manifest.Tables {
+		if !present[num] {
+			missing = append(missing, num)
+		}
+	}
+	slices.Sort(missing)
+	return missing, nil
+}
+
 // OpenLive opens dir using CURRENT and the active MANIFEST when available,
 // skipping obsolete table and log files. For Chromium idb_cmp1 stores, it
-// reads only metadata on OpenLive and loads object stores on demand via
-// LoadStores. When CURRENT or the manifest is missing or unreadable, it falls
-// back to reading all data files.
+// reads only metadata (and caches active log records) on OpenLive, then loads
+// object stores on demand via LoadStores or Records/CurrentRecords. When
+// CURRENT or the manifest is missing, unreadable, or references missing table
+// files, it falls back to reading all data files. The provided ctx governs
+// cancellation for OpenLive and subsequent reads on the returned DB.
 func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -111,11 +148,39 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 		return db, nil
 	}
 
+	missing, err := missingManifestTables(dir, manifest)
+	if err != nil {
+		return nil, err
+	}
+	if len(missing) > 0 {
+		db, openErr := Open(ctx, dir, blobDir, logger)
+		if openErr != nil {
+			return nil, openErr
+		}
+		sections := make([]leveldb.Damage, 0, len(missing))
+		for _, num := range missing {
+			name := fmt.Sprintf("%06d.ldb", num)
+			logger.Warn("manifest references a missing table file; fell back to scanning all leveldb files", "dir", dir, "file", name)
+			sections = append(sections, leveldb.Damage{File: name, Reason: "manifest references missing table file"})
+		}
+		db.addDamage(sections)
+		return db, nil
+	}
+
 	if manifest.Comparator == idbComparatorName {
-		opts := leveldb.ReadOptions{
+		// Read active logs once so subsequent LoadStores calls never reread them.
+		logRecords, logDamage, err := leveldb.ReadDirOptions(ctx, dir, logger, leveldb.ReadOptions{
+			KeepFile: func(number uint64, isLog bool) bool {
+				return isLog && manifest.IsActiveLog(number)
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		tableOpts := leveldb.ReadOptions{
 			KeepFile: func(number uint64, isLog bool) bool {
 				if isLog {
-					return manifest.IsActiveLog(number)
+					return false
 				}
 				ti, ok := manifest.Tables[number]
 				return ok && overlapsMetadata(ti.SmallestUserKey(), ti.LargestUserKey())
@@ -123,9 +188,14 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 			KeepBlock:  overlapsMetadata,
 			KeepRecord: isMetadataKey,
 		}
-		records, damage, err := leveldb.ReadDirOptions(ctx, dir, logger, opts)
+		metaRecords, tableDamage, err := leveldb.ReadDirOptions(ctx, dir, logger, tableOpts)
 		if err != nil {
 			return nil, err
+		}
+		for i := range logRecords {
+			if isMetadataKey(logRecords[i].UserKey()) {
+				metaRecords = append(metaRecords, logRecords[i])
+			}
 		}
 		db := &DB{
 			ctx:          ctx,
@@ -134,10 +204,12 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 			manifest:     manifest,
 			lazyStores:   true,
 			loadedStores: map[storeAddr]bool{},
-			records:      records,
+			logRecords:   logRecords,
+			records:      metaRecords,
 			blobDir:      blobDir,
 		}
-		db.addDamage(damage)
+		db.addDamage(tableDamage)
+		db.addDamage(logDamage)
 		db.readMetadata()
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -204,10 +276,17 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 		return cmp.Compare(a.store, b.store)
 	})
 
+	matchRecord := func(userKey []byte) bool {
+		dbID, storeID, indexID, _, ok := readPrefix(userKey)
+		if !ok || (indexID != indexObjectStoreData && indexID != indexBlobEntry) {
+			return false
+		}
+		return needed[storeAddr{db: dbID, store: storeID}]
+	}
 	opts := leveldb.ReadOptions{
 		KeepFile: func(number uint64, isLog bool) bool {
 			if isLog {
-				return db.manifest.IsActiveLog(number)
+				return false
 			}
 			ti, ok := db.manifest.Tables[number]
 			return ok && overlapsStores(ti.SmallestUserKey(), ti.LargestUserKey(), targets)
@@ -215,17 +294,16 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 		KeepBlock: func(prevUserKey, userKey []byte) bool {
 			return overlapsStores(prevUserKey, userKey, targets)
 		},
-		KeepRecord: func(userKey []byte) bool {
-			dbID, storeID, indexID, _, ok := readPrefix(userKey)
-			if !ok || (indexID != indexObjectStoreData && indexID != indexBlobEntry) {
-				return false
-			}
-			return needed[storeAddr{db: dbID, store: storeID}]
-		},
+		KeepRecord: matchRecord,
 	}
 	records, damage, err := leveldb.ReadDirOptions(ctx, db.dir, db.logger, opts)
 	if err != nil {
 		return err
+	}
+	for i := range db.logRecords {
+		if matchRecord(db.logRecords[i].UserKey()) {
+			records = append(records, db.logRecords[i])
+		}
 	}
 	db.addDamage(damage)
 	if db.storeIndex == nil {
@@ -244,7 +322,9 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 	for _, addr := range targets {
 		db.loadedStores[addr] = true
 	}
-	db.blobEntries = nil
+	if db.blobEntries != nil {
+		db.indexBlobRecords(records)
+	}
 	return ctx.Err()
 }
 

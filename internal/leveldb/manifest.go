@@ -2,7 +2,9 @@ package leveldb
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"strings"
 )
@@ -69,9 +71,20 @@ func (m *Manifest) IsActiveLog(number uint64) bool {
 	return number >= m.LogNumber || (m.PrevLogNumber != 0 && number == m.PrevLogNumber)
 }
 
+// ValidateManifestName checks that name is a safe MANIFEST filename within a
+// LevelDB directory.
+func ValidateManifestName(name string) error {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name || !strings.HasPrefix(name, "MANIFEST-") {
+		return fmt.Errorf("%w: invalid CURRENT target %q", ErrCorrupt, name)
+	}
+	return nil
+}
+
 // ReadManifest reads CURRENT and replays the referenced MANIFEST file in dir.
-// It returns an error wrapping ErrCorrupt when CURRENT or the manifest file is
-// invalid or damaged.
+// When CURRENT itself does not exist, it returns the underlying fs.ErrNotExist
+// error. When CURRENT is invalid, points to a missing manifest, or the
+// manifest is damaged or incomplete, it returns an error wrapping ErrCorrupt
+// (and not fs.ErrNotExist).
 func ReadManifest(ctx context.Context, dir string) (*Manifest, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -81,11 +94,41 @@ func ReadManifest(ctx context.Context, dir string) (*Manifest, error) {
 		return nil, err
 	}
 	name := strings.TrimSpace(string(curBytes))
-	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
-		return nil, fmt.Errorf("%w: invalid CURRENT target %q", ErrCorrupt, name)
+	if err := ValidateManifestName(name); err != nil {
+		return nil, err
 	}
 	data, err := readFile(ctx, filepath.Join(dir, name))
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("%w: manifest %s referenced by CURRENT is missing", ErrCorrupt, name)
+		}
+		return nil, fmt.Errorf("%w: read manifest %s: %w", ErrCorrupt, name, err)
+	}
+	return ParseManifest(ctx, name, data)
+}
+
+type tableKey struct {
+	level  uint64
+	number uint64
+}
+
+type manifestReplay struct {
+	manifest          Manifest
+	byLevel           map[tableKey]TableInfo
+	hasLogNumber      bool
+	hasNextFileNumber bool
+	hasLastSequence   bool
+}
+
+// ParseManifest replays raw MANIFEST file bytes into a Manifest.
+func ParseManifest(ctx context.Context, name string, data []byte) (*Manifest, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ValidateManifestName(name); err != nil {
 		return nil, err
 	}
 	batches, damage, err := readLogBatches(ctx, data)
@@ -98,19 +141,30 @@ func ReadManifest(ctx context.Context, dir string) (*Manifest, error) {
 	if len(batches) == 0 {
 		return nil, fmt.Errorf("%w: manifest %s has no edits", ErrCorrupt, name)
 	}
-	m := &Manifest{File: name, Tables: map[uint64]TableInfo{}}
+	replay := manifestReplay{
+		manifest: Manifest{File: name},
+		byLevel:  map[tableKey]TableInfo{},
+	}
 	for _, b := range batches {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := applyVersionEdit(m, b.data); err != nil {
+		if err := applyVersionEdit(&replay, b.data); err != nil {
 			return nil, fmt.Errorf("%w: manifest %s: %w", ErrCorrupt, name, err)
 		}
 	}
-	return m, nil
+	if !replay.hasLogNumber || !replay.hasNextFileNumber || !replay.hasLastSequence {
+		return nil, fmt.Errorf("%w: manifest %s is missing required metadata", ErrCorrupt, name)
+	}
+	replay.manifest.Tables = make(map[uint64]TableInfo, len(replay.byLevel))
+	for _, info := range replay.byLevel {
+		replay.manifest.Tables[info.Number] = info
+	}
+	return &replay.manifest, nil
 }
 
-func applyVersionEdit(m *Manifest, data []byte) error {
+func applyVersionEdit(r *manifestReplay, data []byte) error {
+	m := &r.manifest
 	pos := 0
 	for pos < len(data) {
 		tag, n := Uvarint(data[pos:], 5)
@@ -132,6 +186,7 @@ func applyVersionEdit(m *Manifest, data []byte) error {
 				return fmt.Errorf("truncated log number at offset %d", pos)
 			}
 			m.LogNumber = v
+			r.hasLogNumber = true
 			pos += k
 		case editPrevLogNumber:
 			v, k := Uvarint(data[pos:], 10)
@@ -146,6 +201,7 @@ func applyVersionEdit(m *Manifest, data []byte) error {
 				return fmt.Errorf("truncated next file number at offset %d", pos)
 			}
 			m.NextFileNumber = v
+			r.hasNextFileNumber = true
 			pos += k
 		case editLastSequence:
 			v, k := Uvarint(data[pos:], 10)
@@ -153,6 +209,7 @@ func applyVersionEdit(m *Manifest, data []byte) error {
 				return fmt.Errorf("truncated last sequence at offset %d", pos)
 			}
 			m.LastSequence = v
+			r.hasLastSequence = true
 			pos += k
 		case editCompactPointer:
 			_, k1 := Uvarint(data[pos:], 5)
@@ -166,7 +223,7 @@ func applyVersionEdit(m *Manifest, data []byte) error {
 			}
 			pos += k2
 		case editDeletedFile:
-			_, k1 := Uvarint(data[pos:], 5)
+			level, k1 := Uvarint(data[pos:], 5)
 			if k1 == 0 {
 				return fmt.Errorf("truncated deleted file level at offset %d", pos)
 			}
@@ -176,7 +233,7 @@ func applyVersionEdit(m *Manifest, data []byte) error {
 				return fmt.Errorf("truncated deleted file number at offset %d", pos)
 			}
 			pos += k2
-			delete(m.Tables, fileNo)
+			delete(r.byLevel, tableKey{level: level, number: fileNo})
 		case editNewFile:
 			level, k1 := Uvarint(data[pos:], 5)
 			if k1 == 0 {
@@ -203,7 +260,7 @@ func applyVersionEdit(m *Manifest, data []byte) error {
 				return fmt.Errorf("truncated new file largest key at offset %d", pos)
 			}
 			pos += k5
-			m.Tables[fileNo] = TableInfo{
+			r.byLevel[tableKey{level: level, number: fileNo}] = TableInfo{
 				Level:    level,
 				Number:   fileNo,
 				Size:     size,

@@ -31,6 +31,7 @@ const (
 	maxEnvelopeDepth         = 4
 	maxKeyDepth              = 1000
 	parallelDecodeThreshold  = 16
+	parallelDecodeWindowSize = 256
 )
 
 // External object types (indexed_db_external_object.h).
@@ -55,15 +56,34 @@ type Record struct {
 	Err error
 }
 
+// ensureStoreLoaded loads the store on demand when db was opened lazily.
+func (db *DB) ensureStoreLoaded(dbNumber, storeID uint64, onBad func(error)) bool {
+	addr := storeAddr{db: dbNumber, store: storeID}
+	if !db.lazyStores || db.loadedStores[addr] {
+		return true
+	}
+	if err := db.LoadStores(db.ctx, func(d, s uint64) bool { return d == dbNumber && s == storeID }); err != nil {
+		if db.ctx.Err() == nil && onBad != nil {
+			onBad(err)
+		}
+		return false
+	}
+	return true
+}
+
 // Records yields every version of every record of an object store, in file
 // order. A version whose value cannot be decoded is passed to onBad and
 // yielded with Err set. A key that cannot be decoded is only passed to onBad.
+// Cancellation follows the context passed to Open or OpenLive.
 func (db *DB) Records(dbNumber, storeID uint64, onBad func(error)) iter.Seq[Record] {
 	if db.storeIndex == nil {
 		db.buildStoreIndex()
 	}
-	entries := db.storeIndex[storeAddr{db: dbNumber, store: storeID}]
 	return func(yield func(Record) bool) {
+		if !db.ensureStoreLoaded(dbNumber, storeID, onBad) {
+			return
+		}
+		entries := db.storeIndex[storeAddr{db: dbNumber, store: storeID}]
 		for _, entry := range entries {
 			if db.ctx.Err() != nil {
 				return
@@ -97,12 +117,16 @@ func (db *DB) Records(dbNumber, storeID uint64, onBad func(error)) iter.Seq[Reco
 // store, in the order each key first appeared. Keys whose newest version is a
 // deletion are omitted without decoding older versions. A winning live version
 // whose value cannot be decoded is passed to onBad and yielded with Err set.
+// Cancellation follows the context passed to Open or OpenLive.
 func (db *DB) CurrentRecords(dbNumber, storeID uint64, onBad func(error)) iter.Seq[Record] {
 	if db.storeIndex == nil {
 		db.buildStoreIndex()
 	}
-	entries := db.storeIndex[storeAddr{db: dbNumber, store: storeID}]
 	return func(yield func(Record) bool) {
+		if !db.ensureStoreLoaded(dbNumber, storeID, onBad) {
+			return
+		}
+		entries := db.storeIndex[storeAddr{db: dbNumber, store: storeID}]
 		type candidate struct {
 			rec *leveldb.Record
 			key []byte
@@ -171,33 +195,42 @@ func (db *DB) CurrentRecords(dbNumber, storeID uint64, onBad func(error)) iter.S
 		if db.ctx.Err() != nil {
 			return
 		}
-		decoded := make([]Record, len(live))
-		workers := min(runtime.GOMAXPROCS(0), len(live))
-		var next atomic.Int64
-		var wg sync.WaitGroup
-		for range workers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					i := int(next.Add(1) - 1)
-					if i >= len(live) || db.ctx.Err() != nil {
-						return
-					}
-					decoded[i] = db.decodeRecord(dbNumber, storeID, live[i].rec, live[i].key)
-				}
-			}()
-		}
-		wg.Wait()
-		if db.ctx.Err() != nil {
-			return
-		}
-		for _, rec := range decoded {
-			if rec.Err != nil {
-				onBad(rec.Err)
-			}
-			if !yield(rec) {
+		// Decode in bounded windows so peak memory stays bounded and callers
+		// that stop early avoid decoding the rest of the store.
+		decoded := make([]Record, min(parallelDecodeWindowSize, len(live)))
+		for start := 0; start < len(live); start += parallelDecodeWindowSize {
+			if db.ctx.Err() != nil {
 				return
+			}
+			window := live[start:min(start+parallelDecodeWindowSize, len(live))]
+			batch := decoded[:len(window)]
+			workers := min(runtime.GOMAXPROCS(0), len(window))
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			for range workers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						i := int(next.Add(1) - 1)
+						if i >= len(window) || db.ctx.Err() != nil {
+							return
+						}
+						batch[i] = db.decodeRecord(dbNumber, storeID, window[i].rec, window[i].key)
+					}
+				}()
+			}
+			wg.Wait()
+			if db.ctx.Err() != nil {
+				return
+			}
+			for _, rec := range batch {
+				if rec.Err != nil {
+					onBad(rec.Err)
+				}
+				if !yield(rec) {
+					return
+				}
 			}
 		}
 	}
@@ -426,31 +459,42 @@ func blobPath(blobDir string, dbNumber, blobNumber uint64) string {
 // loadBlobInfo indexes the newest blob entry list of each record in one pass.
 // Keys whose newest entry list is deleted have no blobs.
 func (db *DB) loadBlobInfo() {
+	db.blobEntries = map[recordKey]blobEntry{}
+	db.blobSeq = map[recordKey]uint64{}
+	db.indexBlobRecords(db.records)
+}
+
+// indexBlobRecords incrementally merges blob entry records into blobEntries.
+func (db *DB) indexBlobRecords(records []leveldb.Record) {
 	type entryList struct {
 		seq  uint64
 		live bool
 		raw  []byte
 	}
 	newest := map[recordKey]entryList{}
-	for i := range db.records {
+	for i := range records {
 		if db.ctx.Err() != nil {
 			return
 		}
-		r := &db.records[i]
+		r := &records[i]
 		userKey := r.UserKey()
 		dbID, storeID, indexID, n, ok := readPrefix(userKey)
 		if !ok || indexID != indexBlobEntry || dbID == 0 || storeID == 0 {
 			continue
 		}
 		k := recordKey{db: dbID, store: storeID, key: string(userKey[n:])}
+		if prevSeq, exists := db.blobSeq[k]; exists && prevSeq > r.Seq {
+			continue
+		}
 		if old, seen := newest[k]; seen && old.seq > r.Seq {
 			continue
 		}
 		newest[k] = entryList{seq: r.Seq, live: r.State == leveldb.Live, raw: r.Value}
 	}
-	db.blobEntries = make(map[recordKey]blobEntry, len(newest))
 	for k, list := range newest {
+		db.blobSeq[k] = list.seq
 		if !list.live {
+			delete(db.blobEntries, k)
 			continue
 		}
 		infos, err := parseBlobEntries(list.raw)

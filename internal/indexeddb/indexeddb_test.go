@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"hash/crc32"
 	"log/slog"
 	"math"
 	"os"
@@ -556,12 +557,294 @@ func TestOpenLiveAndLoadStoresSkipObsoleteAndUnrelatedData(t *testing.T) {
 	}
 	require.Len(t, got, 1)
 
-	// Corrupt CURRENT falls back to raw scanning and reports manifest damage.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte("MANIFEST-missing\n"), 0o600))
+	// Corrupt CURRENT (pointing to a missing manifest) in a clean directory
+	// falls back to raw scanning and reports damage specifically for CURRENT.
+	require.NoError(t, os.Remove(filepath.Join(dir, "999999.ldb")))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte("MANIFEST-000099\n"), 0o600))
 	fallback, err := OpenLive(context.Background(), dir, "", slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
-	assert.NotEmpty(t, fallback.Damage())
+	require.Len(t, fallback.Damage(), 1)
+	assert.Equal(t, "CURRENT", fallback.Damage()[0].File)
 	require.Len(t, fallback.Databases(), 1)
+}
+
+func testMaskedCRC(data []byte) uint32 {
+	crc := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+	return (crc>>15 | crc<<17) + 0xa282ead8
+}
+
+func testMakeBlock(entries [][2][]byte) []byte {
+	var block []byte
+	for _, kv := range entries {
+		block = binary.AppendUvarint(block, 0)
+		block = binary.AppendUvarint(block, uint64(len(kv[0])))
+		block = binary.AppendUvarint(block, uint64(len(kv[1])))
+		block = append(block, kv[0]...)
+		block = append(block, kv[1]...)
+	}
+	block = binary.LittleEndian.AppendUint32(block, 0) // first restart at 0
+	block = binary.LittleEndian.AppendUint32(block, 1) // 1 restart
+	return block
+}
+
+func testAppendBlock(dst, payload []byte, corruptCRC bool) ([]byte, uint64, uint64) {
+	offset := uint64(len(dst))
+	length := uint64(len(payload))
+	dst = append(dst, payload...)
+	dst = append(dst, 0) // uncompressed
+	crc := testMaskedCRC(dst[offset:])
+	if corruptCRC {
+		crc ^= 1
+	}
+	dst = binary.LittleEndian.AppendUint32(dst, crc)
+	return dst, offset, length
+}
+
+func testBuildSSTable(blocks []struct {
+	entries [][2][]byte
+	corrupt bool
+},
+) []byte {
+	table := make([]byte, 0, 256)
+	idxEntries := make([][2][]byte, 0, len(blocks))
+	for _, b := range blocks {
+		raw := testMakeBlock(b.entries)
+		var off, length uint64
+		table, off, length = testAppendBlock(table, raw, b.corrupt)
+		var handle []byte
+		handle = binary.AppendUvarint(handle, off)
+		handle = binary.AppendUvarint(handle, length)
+		lastKey := b.entries[len(b.entries)-1][0]
+		idxEntries = append(idxEntries, [2][]byte{lastKey, handle})
+	}
+	var metaOff, metaLen, idxOff, idxLen uint64
+	table, metaOff, metaLen = testAppendBlock(table, testMakeBlock(nil), false)
+	table, idxOff, idxLen = testAppendBlock(table, testMakeBlock(idxEntries), false)
+	var footer [48]byte
+	var handles []byte
+	handles = binary.AppendUvarint(handles, metaOff)
+	handles = binary.AppendUvarint(handles, metaLen)
+	handles = binary.AppendUvarint(handles, idxOff)
+	handles = binary.AppendUvarint(handles, idxLen)
+	copy(footer[:], handles)
+	binary.LittleEndian.PutUint64(footer[40:], 0xdb4775248b80fb57)
+	return append(table, footer[:]...)
+}
+
+func testInternalKey(userKey []byte, seq uint64, live bool) []byte {
+	kind := uint64(0)
+	if live {
+		kind = 1
+	}
+	out := append([]byte(nil), userKey...)
+	return binary.LittleEndian.AppendUint64(out, (seq<<8)|kind)
+}
+
+func testWriteIDBManifest(t *testing.T, dir string, tables []struct {
+	num               uint64
+	size              uint64
+	smallest, largest []byte
+},
+) {
+	t.Helper()
+	var edit []byte
+	addStr := func(tag byte, s string) {
+		edit = append(edit, tag)
+		edit = binary.AppendUvarint(edit, uint64(len(s)))
+		edit = append(edit, s...)
+	}
+	addVarint := func(tag byte, v uint64) {
+		edit = append(edit, tag)
+		edit = binary.AppendUvarint(edit, v)
+	}
+	addStr(1, idbComparatorName)
+	addVarint(2, 10)
+	addVarint(3, 12)
+	addVarint(4, 100)
+	for _, tbl := range tables {
+		edit = append(edit, 7) // NewFile
+		edit = binary.AppendUvarint(edit, 0)
+		edit = binary.AppendUvarint(edit, tbl.num)
+		edit = binary.AppendUvarint(edit, tbl.size)
+		edit = binary.AppendUvarint(edit, uint64(len(tbl.smallest)))
+		edit = append(edit, tbl.smallest...)
+		edit = binary.AppendUvarint(edit, uint64(len(tbl.largest)))
+		edit = append(edit, tbl.largest...)
+	}
+	frag := make([]byte, 7, 7+len(edit))
+	binary.LittleEndian.PutUint16(frag[4:], uint16(len(edit)))
+	frag[6] = 1 // full
+	frag = append(frag, edit...)
+	binary.LittleEndian.PutUint32(frag, testMaskedCRC(frag[6:]))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte("MANIFEST-000001\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "MANIFEST-000001"), frag, 0o600))
+}
+
+func testIDBString(s string) []byte {
+	out := binary.AppendUvarint(nil, uint64(len(s)))
+	for i := range len(s) {
+		out = append(out, 0, s[i])
+	}
+	return out
+}
+
+func testUTF16BE(s string) []byte {
+	out := make([]byte, 0, len(s)*2)
+	for i := range len(s) {
+		out = append(out, 0, s[i])
+	}
+	return out
+}
+
+func TestOpenLiveIDBCmp1LazyPruningAndOnDemandLoad(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, blobDir := filepath.Join(root, "idb.leveldb"), filepath.Join(root, "idb.blob")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+
+	// Write a blob file for key "k2" in db 1.
+	blobVal := idbtest.Envelope("from-blob")
+	bp := blobPath(blobDir, 1, 1)
+	require.NoError(t, os.MkdirAll(filepath.Dir(bp), 0o700))
+	require.NoError(t, os.WriteFile(bp, blobVal, 0o600))
+
+	// Metadata keys in idb_cmp1 order.
+	dbNameKey := append([]byte{0, 0, 0, 0, databaseNamePrefixByte}, testIDBString("https_example.test_0@1")...)
+	dbNameKey = append(dbNameKey, testIDBString("db1")...)
+	maxStoreKey := append(makePrefix(1, 0, 0), dbMetaMaxObjectStoreID)
+	store1NameKey := append(makePrefix(1, 0, 0), objectStoreMetaByte, 1, objectStoreMetaName)
+	store2NameKey := append(makePrefix(1, 0, 0), objectStoreMetaByte, 2, objectStoreMetaName)
+
+	// Store 1 keys: k1 (inline), k2 (blob), k3 (tombstone), plus blob entry and corrupt secondary index block.
+	k1 := append([]byte{1}, testIDBString("k1")...)
+	k2 := append([]byte{1}, testIDBString("k2")...)
+	k3 := append([]byte{1}, testIDBString("k3")...)
+	blobRef := append(binary.AppendUvarint([]byte{1, 0xff, blinkWrappedPseudoVer, blinkReplaceWithBlob}, uint64(len(blobVal))), 0)
+	blobMeta := binary.AppendUvarint([]byte{0, 1, 0}, uint64(len(blobVal)))
+	secIdxKeyA := append(makePrefix(1, 1, 30), k1...)
+	secIdxKeyB := append(makePrefix(1, 1, 30), k2...)
+
+	// Store 2 key.
+	kOther := append([]byte{1}, testIDBString("other")...)
+
+	tableBytes := testBuildSSTable([]struct {
+		entries [][2][]byte
+		corrupt bool
+	}{
+		{entries: [][2][]byte{
+			{testInternalKey(dbNameKey, 1, true), []byte{1}},
+			{testInternalKey(maxStoreKey, 2, true), []byte{2}},
+			{testInternalKey(store1NameKey, 3, true), testUTF16BE("wanted")},
+			{testInternalKey(store2NameKey, 4, true), testUTF16BE("other")},
+		}},
+		{entries: [][2][]byte{
+			{testInternalKey(append(makePrefix(1, 1, 1), k1...), 10, true), append([]byte{1}, idbtest.Envelope("inline-v")...)},
+			{testInternalKey(append(makePrefix(1, 1, 1), k2...), 11, true), blobRef},
+			{testInternalKey(append(makePrefix(1, 1, 1), k3...), 12, true), append([]byte{1}, idbtest.Envelope("dead")...)},
+			{testInternalKey(append(makePrefix(1, 1, 1), k3...), 13, false), nil},
+			{testInternalKey(append(makePrefix(1, 1, 3), k2...), 14, true), blobMeta},
+		}},
+		// Boundary secondary-index block immediately after (1,1,3): conservatively
+		// read on (1,1) boundary, then records dropped by KeepRecord.
+		{entries: [][2][]byte{
+			{testInternalKey(secIdxKeyA, 15, true), []byte("ignored-boundary")},
+		}},
+		// Interior secondary-index block strictly past (1,1,3) and before (1,2,1):
+		// must be skipped by idb_cmp1 block pruning for both store 1 and store 2.
+		{entries: [][2][]byte{
+			{testInternalKey(secIdxKeyB, 16, true), []byte("ignored-corrupt")},
+		}, corrupt: true},
+		{entries: [][2][]byte{
+			{testInternalKey(append(makePrefix(1, 2, 1), kOther...), 20, true), append([]byte{1}, idbtest.Envelope("store2-v")...)},
+		}},
+	})
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "000001.ldb"), tableBytes, 0o600))
+	testWriteIDBManifest(t, dir, []struct {
+		num               uint64
+		size              uint64
+		smallest, largest []byte
+	}{{
+		num: 1, size: uint64(len(tableBytes)),
+		smallest: testInternalKey(dbNameKey, 1, true),
+		largest:  testInternalKey(append(makePrefix(1, 2, 1), kOther...), 20, true),
+	}})
+
+	db, err := OpenLive(context.Background(), dir, blobDir, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	assert.True(t, db.lazyStores, "idb_cmp1 manifest enables lazy mode")
+	assert.Empty(t, db.loadedStores, "stores are not loaded until requested")
+	assert.Empty(t, db.Damage(), "corrupt secondary-index block was pruned")
+	require.Len(t, db.Databases(), 1)
+
+	require.NoError(t, db.LoadStores(context.Background(), func(dbNumber, storeID uint64) bool {
+		return dbNumber == 1 && storeID == 1
+	}))
+	assert.True(t, db.loadedStores[storeAddr{db: 1, store: 1}])
+	assert.False(t, db.loadedStores[storeAddr{db: 1, store: 2}], "ignored store stays unloaded")
+	assert.Empty(t, db.Damage(), "secondary index block stayed pruned during store load")
+
+	var got1 []any
+	for rec := range db.CurrentRecords(1, 1, func(err error) { t.Fatalf("unexpected error: %v", err) }) {
+		got1 = append(got1, rec.Value)
+	}
+	assert.Equal(t, []any{"inline-v", "from-blob"}, got1, "tombstone k3 omitted, blob k2 resolved")
+
+	// Reading store 2 without calling LoadStores first auto-loads it on demand.
+	var got2 []any
+	for rec := range db.CurrentRecords(1, 2, func(err error) { t.Fatalf("unexpected error: %v", err) }) {
+		got2 = append(got2, rec.Value)
+	}
+	assert.True(t, db.loadedStores[storeAddr{db: 1, store: 2}])
+	assert.Equal(t, []any{"store2-v"}, got2)
+	assert.Empty(t, db.Damage())
+}
+
+func TestOpenLiveMissingManifestTableFallsBackAndReportsDamage(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	dbNameKey := append([]byte{0, 0, 0, 0, databaseNamePrefixByte}, testIDBString("https_example.test_0@1")...)
+	dbNameKey = append(dbNameKey, testIDBString("db1")...)
+	tableBytes := testBuildSSTable([]struct {
+		entries [][2][]byte
+		corrupt bool
+	}{{entries: [][2][]byte{{testInternalKey(dbNameKey, 1, true), []byte{1}}}}})
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "000001.ldb"), tableBytes, 0o600))
+	testWriteIDBManifest(t, dir, []struct {
+		num               uint64
+		size              uint64
+		smallest, largest []byte
+	}{
+		{num: 1, size: uint64(len(tableBytes)), smallest: testInternalKey(dbNameKey, 1, true), largest: testInternalKey(dbNameKey, 1, true)},
+		{num: 5, size: 100, smallest: testInternalKey(makePrefix(2, 1, 1), 2, true), largest: testInternalKey(makePrefix(2, 1, 1), 2, true)},
+	})
+
+	db, err := OpenLive(context.Background(), dir, "", slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	assert.False(t, db.lazyStores, "missing manifest table triggers raw fallback")
+	require.Len(t, db.Databases(), 1)
+	require.Len(t, db.Damage(), 1)
+	assert.Equal(t, "000005.ldb", db.Damage()[0].File)
+	assert.Contains(t, db.Damage()[0].Reason, "missing table")
+}
+
+func TestCurrentRecordsEarlyStopWithBoundedWindows(t *testing.T) {
+	t.Parallel()
+	const total = parallelDecodeWindowSize*2 + 50
+	recs := make([]leveldb.Record, 0, total)
+	for i := range total {
+		k := append(makePrefix(1, 1, indexObjectStoreData), 1, 3, 0, byte('a'+i/676), 0, byte('a'+(i/26)%26), 0, byte('a'+i%26))
+		val := append([]byte{1}, idbtest.Envelope("v-"+strconv.Itoa(i))...)
+		recs = append(recs, leveldb.Record{Key: k, Value: val, Seq: uint64(i + 1), State: leveldb.Live, FileType: leveldb.Log, File: "000001.log"})
+	}
+	db := &DB{ctx: context.Background(), records: recs}
+	var got []any
+	for rec := range db.CurrentRecords(1, 1, func(err error) { t.Fatalf("unexpected error: %v", err) }) {
+		got = append(got, rec.Value)
+		if len(got) == 3 {
+			break
+		}
+	}
+	assert.Equal(t, []any{"v-0", "v-1", "v-2"}, got)
 }
 
 func TestPrefixRangeOverlapHelpers(t *testing.T) {

@@ -150,7 +150,9 @@ type fileResult struct {
 }
 
 // ReadOptions controls which files, table blocks, and records ReadDirOptions
-// reads. Nil callbacks accept everything.
+// reads. Nil callbacks accept everything. KeepBlock and KeepRecord may be
+// called concurrently from multiple worker goroutines and must be safe for
+// concurrent use.
 type ReadOptions struct {
 	// KeepFile reports whether a data file should be read.
 	KeepFile func(number uint64, isLog bool) bool

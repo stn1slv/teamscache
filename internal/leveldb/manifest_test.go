@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,15 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
+
+func wrapManifestEdit(edit []byte) []byte {
+	frag := make([]byte, logHeaderSize, logHeaderSize+len(edit))
+	binary.LittleEndian.PutUint16(frag[4:], uint16(len(edit)))
+	frag[6] = fragFull
+	frag = append(frag, edit...)
+	binary.LittleEndian.PutUint32(frag, maskedCRC(frag[6:]))
+	return frag
+}
 
 func TestReadManifestTracksActiveTablesAndLogs(t *testing.T) {
 	t.Parallel()
@@ -52,7 +62,7 @@ func TestReadManifestTracksActiveTablesAndLogs(t *testing.T) {
 	assert.False(t, manifest.IsActiveLog(0))
 }
 
-func TestReadManifestAppliesDeletionsAndPrevLogNumber(t *testing.T) {
+func TestReadManifestAppliesDeletionsTrivialMoveAndPrevLogNumber(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	var edit []byte
@@ -91,15 +101,13 @@ func TestReadManifestAppliesDeletionsAndPrevLogNumber(t *testing.T) {
 	addNewFile(0, 5, 100, "a", "f")
 	addNewFile(1, 6, 200, "g", "z")
 	addDeletedFile(0, 5)
-
-	frag := make([]byte, logHeaderSize, logHeaderSize+len(edit))
-	binary.LittleEndian.PutUint16(frag[4:], uint16(len(edit)))
-	frag[6] = fragFull
-	frag = append(frag, edit...)
-	binary.LittleEndian.PutUint32(frag, maskedCRC(frag[6:]))
+	// Trivial move where NewFile at level 1 appears before DeletedFile at level 0.
+	addNewFile(0, 7, 150, "m", "n")
+	addNewFile(1, 7, 150, "m", "n")
+	addDeletedFile(0, 7)
 
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte("MANIFEST-000001\n"), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "MANIFEST-000001"), frag, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "MANIFEST-000001"), wrapManifestEdit(edit), 0o600))
 
 	manifest, err := ReadManifest(context.Background(), dir)
 
@@ -111,6 +119,8 @@ func TestReadManifestAppliesDeletionsAndPrevLogNumber(t *testing.T) {
 	assert.Equal(t, uint64(42), manifest.LastSequence)
 	assert.False(t, manifest.IsActiveTable(5), "deleted table is removed")
 	assert.True(t, manifest.IsActiveTable(6))
+	assert.True(t, manifest.IsActiveTable(7), "trivial-move table stays live at its new level")
+	assert.Equal(t, uint64(1), manifest.Tables[7].Level)
 	assert.Equal(t, []byte("g"), manifest.Tables[6].SmallestUserKey())
 	assert.Equal(t, []byte("z"), manifest.Tables[6].LargestUserKey())
 	assert.True(t, manifest.IsActiveLog(8), "prev log number stays active")
@@ -123,16 +133,37 @@ func TestReadManifestErrors(t *testing.T) {
 	_, err := ReadManifest(context.Background(), t.TempDir())
 	require.ErrorIs(t, err, fs.ErrNotExist)
 
-	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte("../escape\n"), 0o600))
-	_, err = ReadManifest(context.Background(), dir)
+	// Path traversal and non-MANIFEST sibling names are rejected.
+	for _, target := range []string{"../escape\n", "LOCK\n", "000001.ldb\n"} {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte(target), 0o600))
+		_, err = ReadManifest(context.Background(), dir)
+		require.ErrorIs(t, err, ErrCorrupt, target)
+		require.NotErrorIs(t, err, fs.ErrNotExist, target)
+	}
+
+	// Missing manifest target referenced by CURRENT returns ErrCorrupt, not fs.ErrNotExist.
+	dirMissing := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dirMissing, "CURRENT"), []byte("MANIFEST-000099\n"), 0o600))
+	_, err = ReadManifest(context.Background(), dirMissing)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.NotErrorIs(t, err, fs.ErrNotExist)
+
+	// Corrupt manifest bytes return ErrCorrupt.
+	dirCorrupt := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dirCorrupt, "CURRENT"), []byte("MANIFEST-000001\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dirCorrupt, "MANIFEST-000001"), []byte("corrupt"), 0o600))
+	_, err = ReadManifest(context.Background(), dirCorrupt)
 	require.ErrorIs(t, err, ErrCorrupt)
 
-	dir2 := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir2, "CURRENT"), []byte("MANIFEST-000001\n"), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(dir2, "MANIFEST-000001"), []byte("corrupt"), 0o600))
-	_, err = ReadManifest(context.Background(), dir2)
+	// Incomplete manifest missing required fields (e.g. only Comparator) returns ErrCorrupt.
+	dirIncomplete := t.TempDir()
+	edit := append([]byte{editComparator, 8}, "idb_cmp1"...)
+	require.NoError(t, os.WriteFile(filepath.Join(dirIncomplete, "CURRENT"), []byte("MANIFEST-000001\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dirIncomplete, "MANIFEST-000001"), wrapManifestEdit(edit), 0o600))
+	_, err = ReadManifest(context.Background(), dirIncomplete)
 	require.ErrorIs(t, err, ErrCorrupt)
+	assert.Contains(t, err.Error(), "missing required metadata")
 }
 
 func TestReadDirOptionsFiltersFilesBlocksAndRecords(t *testing.T) {
@@ -152,7 +183,7 @@ func TestReadDirOptionsFiltersFilesBlocksAndRecords(t *testing.T) {
 	manifest, err := ReadManifest(context.Background(), dir)
 	require.NoError(t, err)
 
-	var blocksSeen, blocksKept int
+	var blocksSeen, blocksKept atomic.Int64
 	wantLo, wantHi := []byte("k-050"), []byte("k-059")
 	records, damage, err := ReadDirOptions(context.Background(), dir, slog.New(slog.DiscardHandler), ReadOptions{
 		KeepFile: func(number uint64, isLog bool) bool {
@@ -162,14 +193,14 @@ func TestReadDirOptionsFiltersFilesBlocksAndRecords(t *testing.T) {
 			return manifest.IsActiveTable(number)
 		},
 		KeepBlock: func(prevUserKey, userKey []byte) bool {
-			blocksSeen++
+			blocksSeen.Add(1)
 			if prevUserKey != nil && bytes.Compare(prevUserKey, wantHi) > 0 {
 				return false
 			}
 			if bytes.Compare(wantLo, userKey) > 0 {
 				return false
 			}
-			blocksKept++
+			blocksKept.Add(1)
 			return true
 		},
 		KeepRecord: func(userKey []byte) bool {
@@ -179,8 +210,8 @@ func TestReadDirOptionsFiltersFilesBlocksAndRecords(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Empty(t, damage, "obsolete corrupt table was skipped")
-	assert.Positive(t, blocksSeen)
-	assert.Less(t, blocksKept, blocksSeen, "most blocks were skipped without decompression")
+	assert.Positive(t, blocksSeen.Load())
+	assert.Less(t, blocksKept.Load(), blocksSeen.Load(), "most blocks were skipped without decompression")
 	require.Len(t, records, 10)
 	assert.Equal(t, "k-050", string(records[0].UserKey()))
 	assert.Equal(t, "k-059", string(records[9].UserKey()))

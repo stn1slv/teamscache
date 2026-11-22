@@ -442,10 +442,11 @@ func TestCopyDataFilesSkipsOtherFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(src, name), []byte("x"), 0o600))
 	}
 
-	stable, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
+	stable, manifestErr, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
 
 	require.NoError(t, err)
 	assert.True(t, stable)
+	require.ErrorIs(t, manifestErr, leveldb.ErrCorrupt, "corrupt CURRENT is surfaced while falling back to data files")
 	entries, err := os.ReadDir(dst)
 	require.NoError(t, err)
 	names := make([]string, 0, len(entries))
@@ -723,10 +724,11 @@ func TestCopyOnceIsStableWhenNothingChanges(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(src, "000003.log"), []byte("x"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(src, "000004.ldb"), []byte("y"), 0o600))
 
-	stable, err := copyOnce(context.Background(), src, dst)
+	res, err := copyOnce(context.Background(), src, dst, false)
 
 	require.NoError(t, err)
-	assert.True(t, stable)
+	assert.True(t, res.stable)
+	require.NoError(t, res.manifestErr)
 	entries, err := os.ReadDir(dst)
 	require.NoError(t, err)
 	assert.Len(t, entries, 2)
@@ -791,14 +793,89 @@ func TestCopyDataFilesWithManifestSkipsObsoleteTables(t *testing.T) {
 	require.NoError(t, idbtest.WriteTeamsSample(src, time.Now()))
 	require.NoError(t, os.WriteFile(filepath.Join(src, "999999.ldb"), []byte("obsolete"), 0o600))
 
-	stable, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
+	stable, manifestErr, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
 
 	require.NoError(t, err)
 	assert.True(t, stable)
+	require.NoError(t, manifestErr)
 	_, err = os.Stat(filepath.Join(dst, "CURRENT"))
 	require.NoError(t, err, "CURRENT is copied when manifest is valid")
 	_, err = os.Stat(filepath.Join(dst, "999999.ldb"))
 	assert.True(t, os.IsNotExist(err), "obsolete table not in manifest is skipped")
+}
+
+func TestOpenForReportsCorruptManifestAsDamage(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte("MANIFEST-000099\n"), 0o600))
+
+	r, err := OpenFor(context.Background(), dir, slog.New(slog.DiscardHandler), ScopeMessages)
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+
+	assert.Len(t, r.Messages(""), 2, "raw fallback still reads all messages")
+	require.Len(t, r.Damage(), 1)
+	assert.Equal(t, "CURRENT", r.Damage()[0].File)
+	assert.Contains(t, r.Damage()[0].Reason, "MANIFEST-000099")
+}
+
+func TestLogsStableAndMissingManifestTables(t *testing.T) {
+	t.Parallel()
+	// Normal append to an active log stays stable; shrinkage or rotation does not.
+	assert.True(t, logsStable(
+		[]fileStamp{{name: "000010.log", size: 100}},
+		[]fileStamp{{name: "000010.log", size: 250}},
+	))
+	assert.False(t, logsStable(
+		[]fileStamp{{name: "000010.log", size: 100}},
+		[]fileStamp{{name: "000010.log", size: 50}},
+	))
+	assert.False(t, logsStable(
+		[]fileStamp{{name: "000010.log", size: 100}},
+		[]fileStamp{{name: "000011.log", size: 100}},
+	))
+
+	// Missing manifest-listed table makes copyOnce report unstable.
+	m := &leveldb.Manifest{Tables: map[uint64]leveldb.TableInfo{1: {Number: 1}, 2: {Number: 2}}}
+	assert.False(t, hasAllManifestTables(m, []fileStamp{{name: "000001.ldb", number: 1}}))
+	assert.True(t, hasAllManifestTables(m, []fileStamp{{name: "000001.ldb", number: 1}, {name: "000002.ldb", number: 2}}))
+}
+
+func TestDiscoverCachesMultipleOriginsInOneProfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LOCALAPPDATA", home)
+
+	makeOrigin := func(origin string, mod time.Time) string {
+		var dir string
+		switch runtime.GOOS {
+		case "darwin":
+			dir = filepath.Join(home, "Library", "Containers", "com.microsoft.teams2", "Data", "Library",
+				"Application Support", "Microsoft", "MSTeams", "EBWebView", "WV2Profile_tfw", "IndexedDB", origin)
+		case "windows":
+			dir = filepath.Join(home, "Packages", "MSTeams_test", "LocalCache", "Microsoft", "MSTeams",
+				"EBWebView", "WV2Profile_tfw", "IndexedDB", origin)
+		default:
+			dir = filepath.Join(home, ".config", "teams", "WV2Profile_tfw", "IndexedDB", origin)
+		}
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.Chtimes(dir, mod, mod))
+		return dir
+	}
+
+	older := makeOrigin("https_teams.microsoft.com_0.indexeddb.leveldb", time.Now().Add(-time.Hour))
+	newer := makeOrigin("https_teams.cloud.microsoft_0.indexeddb.leveldb", time.Now())
+
+	caches := DiscoverCaches()
+	require.Len(t, caches, 2)
+	assert.Equal(t, newer, caches[0].Path)
+	assert.Equal(t, older, caches[1].Path)
+	assert.Equal(t, newer, FindCache())
+
+	got, err := FindCacheFor("WV2Profile_tfw")
+	require.NoError(t, err)
+	assert.Equal(t, newer, got, "profile selection chooses the most recently updated origin")
 }
 
 func TestUpdatedBlobRecordHasZeroSkipped(t *testing.T) {
