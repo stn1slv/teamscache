@@ -1,9 +1,11 @@
 package leveldb
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"path/filepath"
 
 	"github.com/golang/snappy"
@@ -55,17 +57,24 @@ func parseTable(ctx context.Context, data []byte, path string) ([]Record, []Dama
 }
 
 func parseTableFiltered(ctx context.Context, data []byte, path string, opts ReadOptions) ([]Record, []Damage, error) {
+	return parseTableAt(ctx, bytes.NewReader(data), int64(len(data)), path, opts)
+}
+
+func parseTableAt(ctx context.Context, r io.ReaderAt, size int64, path string, opts ReadOptions) ([]Record, []Damage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	if len(data) < tableFooterSize {
+	if size < tableFooterSize {
 		return nil, nil, fmt.Errorf("%w: file shorter than the table footer", ErrCorrupt)
 	}
-	footer := data[len(data)-tableFooterSize:]
+	var footer [tableFooterSize]byte
+	if err := readExactAt(ctx, r, footer[:], size-tableFooterSize); err != nil {
+		return nil, nil, err
+	}
 	if binary.LittleEndian.Uint64(footer[40:]) != tableMagic {
 		return nil, nil, fmt.Errorf("%w: bad table magic number", ErrCorrupt)
 	}
-	_, n, err := readBlockHandle(footer) // meta-index handle, not used
+	_, n, err := readBlockHandle(footer[:]) // meta-index handle, not used
 	if err != nil {
 		return nil, nil, err
 	}
@@ -73,9 +82,12 @@ func parseTableFiltered(ctx context.Context, data []byte, path string, opts Read
 	if err != nil {
 		return nil, nil, err
 	}
-	index, _, err := readBlock(data, indexHandle)
+	index, _, err := readBlockAt(ctx, r, size, indexHandle)
 	if err != nil {
-		return nil, []Damage{blockDamage(data, path, indexHandle, err)}, nil
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		return nil, []Damage{blockDamage(size, path, indexHandle, err)}, nil
 	}
 	indexEntries, err := blockEntries(ctx, index)
 	damage := []Damage{}
@@ -83,7 +95,7 @@ func parseTableFiltered(ctx context.Context, data []byte, path string, opts Read
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		damage = append(damage, blockDamage(data, path, indexHandle, err))
+		damage = append(damage, blockDamage(size, path, indexHandle, err))
 	}
 
 	var records []Record
@@ -104,12 +116,15 @@ func parseTableFiltered(ctx context.Context, data []byte, path string, opts Read
 
 		handle, _, err := readBlockHandle(ie.value)
 		if err != nil {
-			damage = append(damage, blockDamage(data, path, indexHandle, err))
+			damage = append(damage, blockDamage(size, path, indexHandle, err))
 			continue
 		}
-		block, compressed, err := readBlock(data, handle)
+		block, compressed, err := readBlockAt(ctx, r, size, handle)
 		if err != nil {
-			damage = append(damage, blockDamage(data, path, handle, err))
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			damage = append(damage, blockDamage(size, path, handle, err))
 			continue
 		}
 		entries, err := blockEntries(ctx, block)
@@ -133,16 +148,17 @@ func parseTableFiltered(ctx context.Context, data []byte, path string, opts Read
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()
 			}
-			damage = append(damage, blockDamage(data, path, handle, err))
+			damage = append(damage, blockDamage(size, path, handle, err))
 		}
 	}
 	return records, damage, nil
 }
 
-func blockDamage(data []byte, path string, handle blockHandle, err error) Damage {
-	offset := min(handle.offset, uint64(len(data)))
-	length := min(handle.length, uint64(len(data))-offset)
-	length += min(uint64(blockTrailerSize), uint64(len(data))-offset-length)
+func blockDamage(fileSize int64, path string, handle blockHandle, err error) Damage {
+	size := uint64(max(fileSize, 0))
+	offset := min(handle.offset, size)
+	length := min(handle.length, size-offset)
+	length += min(uint64(blockTrailerSize), size-offset-length)
 	return Damage{
 		File: filepath.Base(path), Offset: int64(offset), Length: int64(length), Reason: err.Error(),
 	}
@@ -163,22 +179,56 @@ func tableRecord(key, value []byte, path string, offset int64) Record {
 	return r
 }
 
+func readExactAt(ctx context.Context, r io.ReaderAt, buf []byte, offset int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for done := 0; done < len(buf); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := r.ReadAt(buf[done:], offset+int64(done))
+		done += n
+		if err != nil {
+			if err == io.EOF && done == len(buf) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 func readBlock(data []byte, h blockHandle) (block []byte, compressed bool, err error) {
+	return readBlockAt(context.Background(), bytes.NewReader(data), int64(len(data)), h)
+}
+
+func readBlockAt(ctx context.Context, r io.ReaderAt, fileSize int64, h blockHandle) (block []byte, compressed bool, err error) {
 	// Subtract instead of adding, so that a corrupt handle cannot overflow.
-	size := uint64(len(data))
+	if fileSize < 0 {
+		return nil, false, fmt.Errorf("%w: negative table size", ErrCorrupt)
+	}
+	size := uint64(fileSize)
 	if h.offset > size || size-h.offset < blockTrailerSize || h.length > size-h.offset-blockTrailerSize {
 		return nil, false, fmt.Errorf("%w: block at offset %d runs past the end of the file", ErrCorrupt, h.offset)
 	}
-	raw := data[h.offset : h.offset+h.length]
-	end := h.offset + h.length
-	if maskedCRC(data[h.offset:end+1]) != binary.LittleEndian.Uint32(data[end+1:end+5]) {
+	if h.length > MaxDecodedSize {
+		return nil, false, fmt.Errorf("%w: block at offset %d declares %d bytes", ErrCorrupt, h.offset, h.length)
+	}
+	buf := make([]byte, int(h.length)+blockTrailerSize)
+	if err := readExactAt(ctx, r, buf, int64(h.offset)); err != nil {
+		return nil, false, err
+	}
+	raw := buf[:h.length]
+	compType := buf[h.length]
+	if maskedCRC(buf[:h.length+1]) != binary.LittleEndian.Uint32(buf[h.length+1:]) {
 		return nil, false, fmt.Errorf("%w: checksum mismatch at block offset %d", ErrCorrupt, h.offset)
 	}
-	if data[end] == 0 {
+	if compType == 0 {
 		return raw, false, nil
 	}
-	if data[end] != 1 {
-		return nil, false, fmt.Errorf("%w: unknown compression type %d", ErrCorrupt, data[end])
+	if compType != 1 {
+		return nil, false, fmt.Errorf("%w: unknown compression type %d", ErrCorrupt, compType)
 	}
 	decoded, err := DecodeSnappy(raw)
 	if err != nil {

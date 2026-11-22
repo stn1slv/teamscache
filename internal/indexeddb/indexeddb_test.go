@@ -6,12 +6,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"hash/crc32"
 	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -776,9 +778,11 @@ func TestOpenLiveIDBCmp1LazyPruningAndOnDemandLoad(t *testing.T) {
 	assert.Empty(t, db.Damage(), "corrupt secondary-index block was pruned")
 	require.Len(t, db.Databases(), 1)
 
-	require.NoError(t, db.LoadStores(context.Background(), func(dbNumber, storeID uint64) bool {
+	// Calling BlobFilesFor on a freshly opened lazy DB loads matching stores on demand.
+	gotBlobs := db.BlobFilesFor(func(dbNumber, storeID uint64) bool {
 		return dbNumber == 1 && storeID == 1
-	}))
+	})
+	assert.Equal(t, []string{blobPath("", 1, 1)}, gotBlobs)
 	assert.True(t, db.loadedStores[storeAddr{db: 1, store: 1}])
 	assert.False(t, db.loadedStores[storeAddr{db: 1, store: 2}], "ignored store stays unloaded")
 	assert.Empty(t, db.Damage(), "secondary index block stayed pruned during store load")
@@ -797,6 +801,185 @@ func TestOpenLiveIDBCmp1LazyPruningAndOnDemandLoad(t *testing.T) {
 	assert.True(t, db.loadedStores[storeAddr{db: 1, store: 2}])
 	assert.Equal(t, []any{"store2-v"}, got2)
 	assert.Empty(t, db.Damage())
+}
+
+func TestOpenLiveChecksPrevLogNumberAndTableSize(t *testing.T) {
+	t.Parallel()
+	dbNameKey := append([]byte{0, 0, 0, 0, databaseNamePrefixByte}, testIDBString("https_example.test_0@1")...)
+	dbNameKey = append(dbNameKey, testIDBString("db1")...)
+	tableBytes := testBuildSSTable([]struct {
+		entries [][2][]byte
+		corrupt bool
+	}{{entries: [][2][]byte{{testInternalKey(dbNameKey, 1, true), []byte{1}}}}})
+
+	// Truncated table (manifest declares larger size) falls back and reports damage.
+	dirSize := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dirSize, "000001.ldb"), tableBytes, 0o600))
+	testWriteIDBManifest(t, dirSize, []struct {
+		num               uint64
+		size              uint64
+		smallest, largest []byte
+	}{{
+		num: 1, size: uint64(len(tableBytes) + 64),
+		smallest: testInternalKey(dbNameKey, 1, true),
+		largest:  testInternalKey(dbNameKey, 1, true),
+	}})
+	dbSize, err := OpenLive(context.Background(), dirSize, "", slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	assert.False(t, dbSize.lazyStores)
+	require.Len(t, dbSize.Damage(), 1)
+	assert.Equal(t, "000001.ldb", dbSize.Damage()[0].File)
+	assert.Contains(t, dbSize.Damage()[0].Reason, "does not match manifest size")
+
+	// Missing nonzero PrevLogNumber triggers fallback and reports the missing log.
+	dirPrevLog := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dirPrevLog, "000001.ldb"), tableBytes, 0o600))
+	var edit []byte
+	edit = append(edit, 1) // Comparator
+	edit = binary.AppendUvarint(edit, uint64(len(idbComparatorName)))
+	edit = append(edit, idbComparatorName...)
+	edit = append(edit, 2, 10) // LogNumber
+	edit = append(edit, 9, 8)  // PrevLogNumber = 8 (missing on disk)
+	edit = append(edit, 3, 12) // NextFileNumber
+	edit = append(edit, 4, 1)  // LastSequence
+	edit = append(edit, 7, 0, 1)
+	edit = binary.AppendUvarint(edit, uint64(len(tableBytes)))
+	ik := testInternalKey(dbNameKey, 1, true)
+	edit = binary.AppendUvarint(edit, uint64(len(ik)))
+	edit = append(edit, ik...)
+	edit = binary.AppendUvarint(edit, uint64(len(ik)))
+	edit = append(edit, ik...)
+	frag := make([]byte, 7, 7+len(edit))
+	binary.LittleEndian.PutUint16(frag[4:], uint16(len(edit)))
+	frag[6] = 1
+	frag = append(frag, edit...)
+	binary.LittleEndian.PutUint32(frag, testMaskedCRC(frag[6:]))
+	require.NoError(t, os.WriteFile(filepath.Join(dirPrevLog, "CURRENT"), []byte("MANIFEST-000001\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dirPrevLog, "MANIFEST-000001"), frag, 0o600))
+
+	dbPrev, err := OpenLive(context.Background(), dirPrevLog, "", slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	assert.False(t, dbPrev.lazyStores)
+	require.Len(t, dbPrev.Damage(), 1)
+	assert.Equal(t, "000008.log", dbPrev.Damage()[0].File)
+	assert.Contains(t, dbPrev.Damage()[0].Reason, "previous log")
+}
+
+func TestLoadStoresDetectsDisappearedTableAndContextCancellation(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	dbNameKey := append([]byte{0, 0, 0, 0, databaseNamePrefixByte}, testIDBString("https_example.test_0@1")...)
+	dbNameKey = append(dbNameKey, testIDBString("db1")...)
+	maxStoreKey := append(makePrefix(1, 0, 0), dbMetaMaxObjectStoreID)
+	store1NameKey := append(makePrefix(1, 0, 0), objectStoreMetaByte, 1, objectStoreMetaName)
+	k1 := append([]byte{1}, testIDBString("k1")...)
+
+	metaTable := testBuildSSTable([]struct {
+		entries [][2][]byte
+		corrupt bool
+	}{{entries: [][2][]byte{
+		{testInternalKey(dbNameKey, 1, true), []byte{1}},
+		{testInternalKey(maxStoreKey, 2, true), []byte{1}},
+		{testInternalKey(store1NameKey, 3, true), testUTF16BE("s1")},
+	}}})
+	dataTable := testBuildSSTable([]struct {
+		entries [][2][]byte
+		corrupt bool
+	}{{entries: [][2][]byte{
+		{testInternalKey(append(makePrefix(1, 1, 1), k1...), 4, true), append([]byte{1}, idbtest.Envelope("v1")...)},
+	}}})
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "000001.ldb"), metaTable, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "000002.ldb"), dataTable, 0o600))
+	testWriteIDBManifest(t, dir, []struct {
+		num               uint64
+		size              uint64
+		smallest, largest []byte
+	}{
+		{num: 1, size: uint64(len(metaTable)), smallest: testInternalKey(dbNameKey, 1, true), largest: testInternalKey(store1NameKey, 3, true)},
+		{num: 2, size: uint64(len(dataTable)), smallest: testInternalKey(append(makePrefix(1, 1, 1), k1...), 4, true), largest: testInternalKey(append(makePrefix(1, 1, 1), k1...), 4, true)},
+	})
+
+	// Cancel OpenLive ctx before calling LoadStores with Background ctx.
+	openCtx, cancel := context.WithCancel(context.Background())
+	dbCanceled, err := OpenLive(openCtx, dir, "", slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	cancel()
+	require.ErrorIs(t, dbCanceled.LoadStores(context.Background(), nil), context.Canceled)
+	assert.Empty(t, dbCanceled.loadedStores)
+
+	// Remove data table after OpenLive; lazy read reports damage and skips marking loaded.
+	db, err := OpenLive(context.Background(), dir, "", slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(filepath.Join(dir, "000002.ldb")))
+
+	var onBadErrs []error
+	for range db.CurrentRecords(1, 1, func(err error) { onBadErrs = append(onBadErrs, err) }) {
+		t.Fatal("expected no records when table disappeared")
+	}
+	assert.NotEmpty(t, onBadErrs)
+	assert.False(t, db.loadedStores[storeAddr{db: 1, store: 1}])
+	damage := db.Damage()
+	files := make([]string, 0, len(damage))
+	for _, d := range damage {
+		files = append(files, d.File)
+	}
+	assert.Contains(t, files, "000002.ldb")
+}
+
+func TestCurrentRecordsParallelBlobsNilOnBadAndConcurrentAccess(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, blobDir := filepath.Join(root, "cache.leveldb"), filepath.Join(root, "cache.blob")
+	const count = parallelDecodeThreshold + 12
+	recs1 := make([]idbtest.Record, 0, count)
+	recs2 := make([]idbtest.Record, 0, count)
+	for i := range count {
+		recs1 = append(recs1, idbtest.Record{Key: fmt.Sprintf("k-%03d", i), Value: fmt.Sprintf("blob-%d", i), Wrapping: idbtest.Blob})
+		recs2 = append(recs2, idbtest.Record{Key: fmt.Sprintf("m-%03d", i), Value: fmt.Sprintf("inline-%d", i)})
+	}
+	require.NoError(t, idbtest.Write(dir, blobDir, []idbtest.Database{{
+		Number: 1, Name: "db1",
+		Stores: []idbtest.Store{
+			{Name: "s1", Records: recs1},
+			{Name: "s2", Records: recs2},
+		},
+	}}))
+
+	db, err := OpenLive(context.Background(), dir, blobDir, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+
+	// Verify concurrent CurrentRecords, LoadStores, BlobFiles, and Damage pass -race
+	// and nil onBad callbacks do not panic.
+	var wg sync.WaitGroup
+	wg.Add(3)
+	var got1, got2 []any
+	go func() {
+		defer wg.Done()
+		for rec := range db.CurrentRecords(1, 1, nil) {
+			if rec.Err == nil {
+				got1 = append(got1, rec.Value)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for rec := range db.CurrentRecords(1, 2, nil) {
+			if rec.Err == nil {
+				got2 = append(got2, rec.Value)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_ = db.BlobFiles()
+		_ = db.Damage()
+	}()
+	wg.Wait()
+
+	assert.Len(t, got1, count)
+	assert.Len(t, got2, count)
+	assert.Equal(t, "blob-0", got1[0])
+	assert.Equal(t, fmt.Sprintf("blob-%d", count-1), got1[count-1])
 }
 
 func TestOpenLiveMissingManifestTableFallsBackAndReportsDamage(t *testing.T) {

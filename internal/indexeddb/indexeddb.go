@@ -17,8 +17,10 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
+	"sync"
 	"unicode/utf16"
 
 	"github.com/stn1slv/teamscache/internal/leveldb"
@@ -53,12 +55,16 @@ type indexedRecord struct {
 
 // DB is an IndexedDB LevelDB, read into memory. The context passed to Open or
 // OpenLive governs cancellation for all subsequent reads on the DB.
+// Internal synchronization protects lazy store loads and map reads so DB
+// methods can safely overlap, though callers normally use a DB sequentially.
 type DB struct {
 	ctx          context.Context
 	dir          string
 	logger       *slog.Logger
 	manifest     *leveldb.Manifest
 	lazyStores   bool
+	loadMu       sync.Mutex
+	mu           sync.RWMutex
 	loadedStores map[storeAddr]bool
 	logRecords   []leveldb.Record
 	damage       []leveldb.Damage
@@ -75,6 +81,30 @@ type DB struct {
 	blobSeq     map[recordKey]uint64
 }
 
+func (db *DB) ctxErr() error {
+	if db.ctx == nil {
+		return nil
+	}
+	return db.ctx.Err()
+}
+
+// mergeContext returns a context that is canceled when either ctx or other is
+// canceled.
+func mergeContext(ctx, other context.Context) (context.Context, context.CancelFunc) {
+	if other == nil || other == ctx || other.Done() == nil {
+		return ctx, func() {}
+	}
+	if ctx == nil {
+		return other, func() {}
+	}
+	merged, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(other, cancel)
+	return merged, func() {
+		stop()
+		cancel()
+	}
+}
+
 // Open reads all records of the LevelDB in dir. blobDir is the folder that
 // holds values too large for LevelDB; it may be empty. The provided ctx governs
 // cancellation for Open and subsequent reads on the returned DB.
@@ -84,7 +114,7 @@ func Open(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, e
 		return nil, err
 	}
 	db := &DB{ctx: ctx, dir: dir, logger: logger, records: records, blobDir: blobDir}
-	db.addDamage(damage)
+	db.addDamageLocked(damage)
 	db.readMetadata()
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -92,42 +122,87 @@ func Open(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, e
 	return db, nil
 }
 
-// missingManifestTables returns sorted table file numbers listed in manifest
-// that are not present as regular .ldb or .sst files in dir.
-func missingManifestTables(dir string, manifest *leveldb.Manifest) ([]uint64, error) {
-	if len(manifest.Tables) == 0 {
+// checkManifestFiles verifies that every table listed in manifest is present as
+// a regular file in dir with the expected size, and that a nonzero
+// PrevLogNumber log file exists.
+func checkManifestFiles(dir string, manifest *leveldb.Manifest) ([]leveldb.Damage, error) {
+	if len(manifest.Tables) == 0 && manifest.PrevLogNumber == 0 {
 		return nil, nil
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read leveldb directory: %w", err)
 	}
-	present := make(map[uint64]bool, len(entries))
+	type fileMeta struct {
+		name string
+		size int64
+	}
+	presentTables := make(map[uint64]fileMeta, len(entries))
+	presentLogs := make(map[uint64]bool, len(entries))
 	for _, e := range entries {
 		if !e.Type().IsRegular() {
 			continue
 		}
-		if num, isLog, ok := leveldb.ParseFileNumber(e.Name()); ok && !isLog {
-			present[num] = true
+		num, isLog, ok := leveldb.ParseFileNumber(e.Name())
+		if !ok {
+			continue
 		}
+		if isLog {
+			presentLogs[num] = true
+			continue
+		}
+		info, infoErr := e.Info()
+		if errors.Is(infoErr, fs.ErrNotExist) {
+			continue
+		}
+		if infoErr != nil {
+			return nil, fmt.Errorf("stat leveldb table %s: %w", e.Name(), infoErr)
+		}
+		presentTables[num] = fileMeta{name: e.Name(), size: info.Size()}
 	}
-	var missing []uint64
+
+	tableNums := make([]uint64, 0, len(manifest.Tables))
 	for num := range manifest.Tables {
-		if !present[num] {
-			missing = append(missing, num)
+		tableNums = append(tableNums, num)
+	}
+	slices.Sort(tableNums)
+
+	var problems []leveldb.Damage
+	for _, num := range tableNums {
+		ti := manifest.Tables[num]
+		meta, ok := presentTables[num]
+		if !ok {
+			problems = append(problems, leveldb.Damage{
+				File:   fmt.Sprintf("%06d.ldb", num),
+				Reason: "manifest references missing table file",
+			})
+			continue
+		}
+		if ti.Size > 0 && (meta.size < 0 || uint64(meta.size) != ti.Size) {
+			problems = append(problems, leveldb.Damage{
+				File:   meta.name,
+				Reason: fmt.Sprintf("table file size %d does not match manifest size %d", meta.size, ti.Size),
+			})
 		}
 	}
-	slices.Sort(missing)
-	return missing, nil
+	if manifest.PrevLogNumber != 0 && !presentLogs[manifest.PrevLogNumber] {
+		problems = append(problems, leveldb.Damage{
+			File:   fmt.Sprintf("%06d.log", manifest.PrevLogNumber),
+			Reason: "manifest references missing previous log file",
+		})
+	}
+	return problems, nil
 }
 
 // OpenLive opens dir using CURRENT and the active MANIFEST when available,
 // skipping obsolete table and log files. For Chromium idb_cmp1 stores, it
 // reads only metadata (and caches active log records) on OpenLive, then loads
-// object stores on demand via LoadStores or Records/CurrentRecords. When
-// CURRENT or the manifest is missing, unreadable, or references missing table
-// files, it falls back to reading all data files. The provided ctx governs
-// cancellation for OpenLive and subsequent reads on the returned DB.
+// object stores on demand via LoadStores, BlobFiles/BlobFilesFor, or
+// Records/CurrentRecords; callers using lazy loading should pass an immutable
+// snapshot directory. When CURRENT or the manifest is missing, unreadable, or
+// references missing or size-mismatched files, it falls back to reading all
+// data files. The provided ctx governs cancellation for OpenLive and subsequent
+// reads on the returned DB.
 func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -148,22 +223,19 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 		return db, nil
 	}
 
-	missing, err := missingManifestTables(dir, manifest)
+	problems, err := checkManifestFiles(dir, manifest)
 	if err != nil {
 		return nil, err
 	}
-	if len(missing) > 0 {
+	if len(problems) > 0 {
 		db, openErr := Open(ctx, dir, blobDir, logger)
 		if openErr != nil {
 			return nil, openErr
 		}
-		sections := make([]leveldb.Damage, 0, len(missing))
-		for _, num := range missing {
-			name := fmt.Sprintf("%06d.ldb", num)
-			logger.Warn("manifest references a missing table file; fell back to scanning all leveldb files", "dir", dir, "file", name)
-			sections = append(sections, leveldb.Damage{File: name, Reason: "manifest references missing table file"})
+		for _, p := range problems {
+			logger.Warn("manifest file check failed; fell back to scanning all leveldb files", "dir", dir, "file", p.File, "reason", p.Reason)
 		}
-		db.addDamage(sections)
+		db.addDamage(problems)
 		return db, nil
 	}
 
@@ -208,8 +280,8 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 			records:      metaRecords,
 			blobDir:      blobDir,
 		}
-		db.addDamage(tableDamage)
-		db.addDamage(logDamage)
+		db.addDamageLocked(tableDamage)
+		db.addDamageLocked(logDamage)
 		db.readMetadata()
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -230,7 +302,7 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 		return nil, err
 	}
 	db := &DB{ctx: ctx, dir: dir, logger: logger, manifest: manifest, records: records, blobDir: blobDir}
-	db.addDamage(damage)
+	db.addDamageLocked(damage)
 	db.readMetadata()
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -240,14 +312,22 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 
 // LoadStores loads object store data and blob entries for unloaded stores
 // accepted by accept. A nil accept loads all stores. When the database was not
-// opened lazily, LoadStores is a no-op.
+// opened lazily, LoadStores is a no-op. Cancellation observes both ctx and the
+// context passed to OpenLive.
 func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint64) bool) error {
-	if err := ctx.Err(); err != nil {
+	loadCtx, cancel := mergeContext(ctx, db.ctx)
+	defer cancel()
+	if err := loadCtx.Err(); err != nil {
 		return err
 	}
 	if !db.lazyStores {
 		return nil
 	}
+
+	db.loadMu.Lock()
+	defer db.loadMu.Unlock()
+
+	db.mu.RLock()
 	needed := map[storeAddr]bool{}
 	var targets []storeAddr
 	for _, d := range db.databases {
@@ -266,8 +346,9 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 			}
 		}
 	}
+	db.mu.RUnlock()
 	if len(targets) == 0 {
-		return nil
+		return loadCtx.Err()
 	}
 	slices.SortFunc(targets, func(a, b storeAddr) int {
 		if c := cmp.Compare(a.db, b.db); c != 0 {
@@ -275,6 +356,14 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 		}
 		return cmp.Compare(a.store, b.store)
 	})
+
+	expectedTables := map[uint64]bool{}
+	for num, ti := range db.manifest.Tables {
+		if overlapsStores(ti.SmallestUserKey(), ti.LargestUserKey(), targets) {
+			expectedTables[num] = true
+		}
+	}
+	seenTables := make(map[uint64]bool, len(expectedTables))
 
 	matchRecord := func(userKey []byte) bool {
 		dbID, storeID, indexID, _, ok := readPrefix(userKey)
@@ -288,24 +377,66 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 			if isLog {
 				return false
 			}
-			ti, ok := db.manifest.Tables[number]
-			return ok && overlapsStores(ti.SmallestUserKey(), ti.LargestUserKey(), targets)
+			if expectedTables[number] {
+				seenTables[number] = true
+				return true
+			}
+			return false
 		},
 		KeepBlock: func(prevUserKey, userKey []byte) bool {
 			return overlapsStores(prevUserKey, userKey, targets)
 		},
 		KeepRecord: matchRecord,
 	}
-	records, damage, err := leveldb.ReadDirOptions(ctx, db.dir, db.logger, opts)
+	records, damage, err := leveldb.ReadDirOptions(loadCtx, db.dir, db.logger, opts)
 	if err != nil {
+		if loadCtx.Err() != nil {
+			return loadCtx.Err()
+		}
 		return err
 	}
+	if len(seenTables) < len(expectedTables) {
+		var missing []uint64
+		for num := range expectedTables {
+			if !seenTables[num] {
+				missing = append(missing, num)
+			}
+		}
+		slices.Sort(missing)
+		sections := make([]leveldb.Damage, 0, len(missing))
+		for _, num := range missing {
+			sections = append(sections, leveldb.Damage{
+				File:   fmt.Sprintf("%06d.ldb", num),
+				Reason: "manifest table missing during store load",
+			})
+		}
+		db.addDamage(sections)
+		return fmt.Errorf("%w: manifest table %06d.ldb missing during store load", leveldb.ErrCorrupt, missing[0])
+	}
 	for i := range db.logRecords {
+		if err := loadCtx.Err(); err != nil {
+			return err
+		}
 		if matchRecord(db.logRecords[i].UserKey()) {
 			records = append(records, db.logRecords[i])
 		}
 	}
-	db.addDamage(damage)
+	if err := loadCtx.Err(); err != nil {
+		return err
+	}
+
+	// Precompute blob updates before locking so cancellation leaves DB unchanged.
+	parsedBlobs, err := collectBlobEntries(loadCtx, records)
+	if err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := loadCtx.Err(); err != nil {
+		return err
+	}
+	db.addDamageLocked(damage)
 	if db.storeIndex == nil {
 		db.storeIndex = map[storeAddr][]indexedRecord{}
 	}
@@ -319,16 +450,25 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 		addr := storeAddr{db: dbID, store: storeID}
 		db.storeIndex[addr] = append(db.storeIndex[addr], indexedRecord{idx: base + i, prefixLen: n})
 	}
+	if db.blobEntries != nil {
+		db.mergeBlobEntriesLocked(parsedBlobs)
+	}
 	for _, addr := range targets {
 		db.loadedStores[addr] = true
 	}
-	if db.blobEntries != nil {
-		db.indexBlobRecords(records)
-	}
-	return ctx.Err()
+	return nil
 }
 
 func (db *DB) addDamage(sections []leveldb.Damage) {
+	if len(sections) == 0 {
+		return
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.addDamageLocked(sections)
+}
+
+func (db *DB) addDamageLocked(sections []leveldb.Damage) {
 	if len(sections) == 0 {
 		return
 	}
@@ -426,10 +566,12 @@ func overlapsStores(loKey, hiKey []byte, targets []storeAddr) bool {
 
 // Damage returns the file sections skipped while reading LevelDB.
 func (db *DB) Damage() []leveldb.Damage {
-	if db.damage == nil {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if len(db.damage) == 0 {
 		return []leveldb.Damage{}
 	}
-	return db.damage
+	return slices.Clone(db.damage)
 }
 
 // BlobFiles lists referenced blob files relative to the blob directory.
@@ -438,11 +580,23 @@ func (db *DB) BlobFiles() []string {
 }
 
 // BlobFilesFor lists referenced blob files relative to the blob directory for
-// stores accepted by accept. A nil accept matches all stores.
+// stores accepted by accept. A nil accept matches all stores. On a lazily
+// opened DB, matching stores are loaded on demand.
 func (db *DB) BlobFilesFor(accept func(dbNumber, storeID uint64) bool) []string {
-	if db.blobEntries == nil {
-		db.loadBlobInfo()
+	if db.lazyStores {
+		if err := db.LoadStores(db.ctx, accept); err != nil && db.ctxErr() == nil {
+			if db.logger != nil {
+				db.logger.Warn("could not load stores while listing blob files", "dir", db.dir, "error", err)
+			}
+			db.addDamage([]leveldb.Damage{{
+				File:   filepath.Base(db.dir),
+				Reason: fmt.Sprintf("load stores for blob listing: %v", err),
+			}})
+		}
 	}
+	db.ensureBlobInfo()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	seen := map[string]bool{}
 	for key, entry := range db.blobEntries {
 		if accept != nil && !accept(key.db, key.store) {

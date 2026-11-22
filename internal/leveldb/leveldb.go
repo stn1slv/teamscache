@@ -167,6 +167,9 @@ type ReadOptions struct {
 }
 
 func parseDataFile(ctx context.Context, f dataFile, opts ReadOptions) fileResult {
+	if !f.isLog && opts.KeepBlock != nil {
+		return parseTableFileSelective(ctx, f.path, opts)
+	}
 	data, err := readFile(ctx, f.path)
 	if err != nil {
 		return fileResult{err: fmt.Errorf("read %s: %w", f.path, err)}
@@ -188,6 +191,27 @@ func parseDataFile(ctx context.Context, f dataFile, opts ReadOptions) fileResult
 		return res
 	}
 	recs, sections, err := parseTableFiltered(ctx, data, f.path, opts)
+	return tableFileResult(ctx, f.path, int64(len(data)), recs, sections, err)
+}
+
+func parseTableFileSelective(ctx context.Context, path string, opts ReadOptions) fileResult {
+	file, err := os.Open(path)
+	if err != nil {
+		return fileResult{err: fmt.Errorf("read %s: %w", path, err)}
+	}
+	defer func() { _ = file.Close() }() // read-only, the read error is what matters
+	info, err := file.Stat()
+	if err != nil {
+		return fileResult{err: fmt.Errorf("read %s: %w", path, err)}
+	}
+	recs, sections, parseErr := parseTableAt(ctx, file, info.Size(), path, opts)
+	if parseErr != nil && !errors.Is(parseErr, ErrCorrupt) && ctx.Err() == nil {
+		return fileResult{err: fmt.Errorf("read %s: %w", path, parseErr)}
+	}
+	return tableFileResult(ctx, path, info.Size(), recs, sections, parseErr)
+}
+
+func tableFileResult(ctx context.Context, path string, size int64, recs []Record, sections []Damage, err error) fileResult {
 	if ctx.Err() != nil {
 		return fileResult{err: ctx.Err()}
 	}
@@ -196,12 +220,12 @@ func parseDataFile(ctx context.Context, f dataFile, opts ReadOptions) fileResult
 	if err != nil {
 		res.warnings = append(res.warnings, fileWarning{
 			msg:  "skipped the unreadable part of a table file",
-			args: []any{"file", f.path, "records_read", len(recs), "error", err},
+			args: []any{"file", path, "records_read", len(recs), "error", err},
 		})
-		res.damage = append(res.damage, Damage{File: filepath.Base(f.path), Length: int64(len(data)), Reason: err.Error()})
+		res.damage = append(res.damage, Damage{File: filepath.Base(path), Length: size, Reason: err.Error()})
 	}
 	for _, section := range sections {
-		res.warnings = append(res.warnings, sectionWarning("skipped damaged table data", f.path, section.Offset, section.Length, section.Reason))
+		res.warnings = append(res.warnings, sectionWarning("skipped damaged table data", path, section.Offset, section.Length, section.Reason))
 	}
 	res.damage = append(res.damage, sections...)
 	return res

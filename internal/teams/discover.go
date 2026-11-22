@@ -16,14 +16,16 @@ const (
 	leveldbSuffix = ".indexeddb.leveldb"
 )
 
-// teamsOriginHosts are the known Microsoft Teams hostnames (and their
-// subdomains) whose IndexedDB folders hold Teams caches.
-var teamsOriginHosts = []string{
-	"teams.microsoft.com",
-	"teams.cloud.microsoft",
-	"teams.live.com",
-	"teams.microsoft.us",
-	"teams.microsoftonline.cn",
+// teamsOriginHosts are the known Microsoft Teams web client hostnames whose
+// IndexedDB folders hold Teams caches.
+var teamsOriginHosts = map[string]bool{
+	"teams.microsoft.com":      true,
+	"teams.cloud.microsoft":    true,
+	"teams.live.com":           true,
+	"teams.microsoft.us":       true,
+	"dod.teams.microsoft.us":   true,
+	"gov.teams.microsoft.us":   true,
+	"teams.microsoftonline.cn": true,
 }
 
 // isTeamsOriginDir reports whether a folder name under IndexedDB belongs to a
@@ -33,29 +35,15 @@ func isTeamsOriginDir(name string) bool {
 	if !ok {
 		return false
 	}
-	if rest, ok := strings.CutPrefix(stem, "https_"); ok {
-		stem = rest
-	} else if rest, ok := strings.CutPrefix(stem, "http_"); ok {
-		stem = rest
-	} else {
+	host, ok := strings.CutPrefix(stem, "https_")
+	if !ok {
 		return false
 	}
-	idx := strings.LastIndexByte(stem, '_')
-	if idx <= 0 || idx == len(stem)-1 {
+	host, ok = strings.CutSuffix(host, "_0")
+	if !ok {
 		return false
 	}
-	for i := idx + 1; i < len(stem); i++ {
-		if stem[i] < '0' || stem[i] > '9' {
-			return false
-		}
-	}
-	host := stem[:idx]
-	for _, allowed := range teamsOriginHosts {
-		if host == allowed || strings.HasSuffix(host, "."+allowed) {
-			return true
-		}
-	}
-	return false
+	return teamsOriginHosts[host]
 }
 
 // DiscoveredCache is one Teams IndexedDB folder found on this computer.

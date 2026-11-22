@@ -2,6 +2,9 @@ package teams
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
+	"hash/crc32"
 	"iter"
 	"log/slog"
 	"os"
@@ -442,11 +445,12 @@ func TestCopyDataFilesSkipsOtherFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(src, name), []byte("x"), 0o600))
 	}
 
-	stable, manifestErr, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
+	stable, manifestErr, manifestDamage, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
 
 	require.NoError(t, err)
 	assert.True(t, stable)
 	require.ErrorIs(t, manifestErr, leveldb.ErrCorrupt, "corrupt CURRENT is surfaced while falling back to data files")
+	assert.Empty(t, manifestDamage)
 	entries, err := os.ReadDir(dst)
 	require.NoError(t, err)
 	names := make([]string, 0, len(entries))
@@ -737,16 +741,21 @@ func TestCopyOnceIsStableWhenNothingChanges(t *testing.T) {
 func TestIsTeamsOriginDir(t *testing.T) {
 	t.Parallel()
 	for name, want := range map[string]bool{
-		"https_teams.microsoft.com_0.indexeddb.leveldb":       true,
-		"https_teams.cloud.microsoft_0.indexeddb.leveldb":     true,
-		"https_teams.live.com_0.indexeddb.leveldb":            true,
-		"https_teams.microsoft.us_0.indexeddb.leveldb":        true,
-		"https_dod.teams.microsoft.us_0.indexeddb.leveldb":    true,
-		"https_teams.microsoftonline.cn_0.indexeddb.leveldb":  true,
-		"https_contoso-my.sharepoint.com_0.indexeddb.leveldb": false,
-		"https_evil-teams.microsoft.com_0.indexeddb.leveldb":  false,
-		"https_teams.microsoft.com_0.indexeddb.blob":          false,
-		"https_teams.microsoft.com_abc.indexeddb.leveldb":     false,
+		"https_teams.microsoft.com_0.indexeddb.leveldb":         true,
+		"https_teams.cloud.microsoft_0.indexeddb.leveldb":       true,
+		"https_teams.live.com_0.indexeddb.leveldb":              true,
+		"https_teams.microsoft.us_0.indexeddb.leveldb":          true,
+		"https_dod.teams.microsoft.us_0.indexeddb.leveldb":      true,
+		"https_gov.teams.microsoft.us_0.indexeddb.leveldb":      true,
+		"https_teams.microsoftonline.cn_0.indexeddb.leveldb":    true,
+		"https_statics.teams.microsoft.com_0.indexeddb.leveldb": false,
+		"https_.teams.microsoft.com_0.indexeddb.leveldb":        false,
+		"http_teams.microsoft.com_0.indexeddb.leveldb":          false,
+		"https_teams.microsoft.com_8443.indexeddb.leveldb":      false,
+		"https_contoso-my.sharepoint.com_0.indexeddb.leveldb":   false,
+		"https_evil-teams.microsoft.com_0.indexeddb.leveldb":    false,
+		"https_teams.microsoft.com_0.indexeddb.blob":            false,
+		"https_teams.microsoft.com_abc.indexeddb.leveldb":       false,
 	} {
 		assert.Equal(t, want, isTeamsOriginDir(name), name)
 	}
@@ -793,11 +802,12 @@ func TestCopyDataFilesWithManifestSkipsObsoleteTables(t *testing.T) {
 	require.NoError(t, idbtest.WriteTeamsSample(src, time.Now()))
 	require.NoError(t, os.WriteFile(filepath.Join(src, "999999.ldb"), []byte("obsolete"), 0o600))
 
-	stable, manifestErr, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
+	stable, manifestErr, manifestDamage, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
 
 	require.NoError(t, err)
 	assert.True(t, stable)
 	require.NoError(t, manifestErr)
+	assert.Empty(t, manifestDamage)
 	_, err = os.Stat(filepath.Join(dst, "CURRENT"))
 	require.NoError(t, err, "CURRENT is copied when manifest is valid")
 	_, err = os.Stat(filepath.Join(dst, "999999.ldb"))
@@ -820,6 +830,98 @@ func TestOpenForReportsCorruptManifestAsDamage(t *testing.T) {
 	assert.Contains(t, r.Damage()[0].Reason, "MANIFEST-000099")
 }
 
+func TestOpenForFallbackOnUnreadableCurrentAndSymlink(t *testing.T) {
+	t.Parallel()
+	// CURRENT replaced by a directory (non-regular, unreadable as a file) falls back cleanly.
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	require.NoError(t, os.Remove(filepath.Join(dir, "CURRENT")))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "CURRENT"), 0o700))
+
+	r, err := OpenFor(context.Background(), dir, slog.New(slog.DiscardHandler), ScopeMessages)
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+	assert.Len(t, r.Messages(""), 2)
+	require.Len(t, r.Damage(), 1)
+	assert.Equal(t, "CURRENT", r.Damage()[0].File)
+
+	// CURRENT as a symlink is rejected and falls back cleanly.
+	dirSym := filepath.Join(t.TempDir(), "cache-sym.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dirSym, time.Now()))
+	target := filepath.Join(t.TempDir(), "real-current")
+	require.NoError(t, os.WriteFile(target, []byte("MANIFEST-000001\n"), 0o600))
+	require.NoError(t, os.Remove(filepath.Join(dirSym, "CURRENT")))
+	require.NoError(t, os.Symlink(target, filepath.Join(dirSym, "CURRENT")))
+
+	rSym, err := OpenFor(context.Background(), dirSym, slog.New(slog.DiscardHandler), ScopeMessages)
+	require.NoError(t, err)
+	t.Cleanup(rSym.Close)
+	assert.Len(t, rSym.Messages(""), 2)
+	require.Len(t, rSym.Damage(), 1)
+	assert.Equal(t, "CURRENT", rSym.Damage()[0].File)
+}
+
+func TestOpenForReportsMissingManifestTableByName(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+
+	// Remove one active table listed in the manifest while keeping log/other files.
+	manifest, err := leveldb.ReadManifest(context.Background(), dir)
+	require.NoError(t, err)
+	if len(manifest.Tables) == 0 {
+		// Force table creation by adding an extra manifest-referenced missing table.
+		entries, readErr := os.ReadDir(dir)
+		require.NoError(t, readErr)
+		var ldbName string
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".ldb") || strings.HasSuffix(e.Name(), ".sst") {
+				ldbName = e.Name()
+				break
+			}
+		}
+		require.Empty(t, ldbName)
+	}
+	// Delete the table if present, otherwise synthesize a manifest referencing missing table 5.
+	var expectedFile string
+	if len(manifest.Tables) > 0 {
+		for num := range manifest.Tables {
+			expectedFile = fmt.Sprintf("%06d.ldb", num)
+			_ = os.Remove(filepath.Join(dir, expectedFile))
+			_ = os.Remove(filepath.Join(dir, fmt.Sprintf("%06d.sst", num)))
+			break
+		}
+	} else {
+		// Append a NewFile edit for missing table 5 to the existing manifest.
+		mPath := filepath.Join(dir, manifest.File)
+		// #nosec G703 -- mPath is inside t.TempDir() and manifest.File passed ValidateManifestName.
+		mData, readErr := os.ReadFile(mPath)
+		require.NoError(t, readErr)
+		edit := []byte{7, 0, 5, 100, 1, 'a', 1, 'z'}
+		frag := make([]byte, 7, 7+len(edit))
+		frag[4] = byte(len(edit))
+		frag[6] = 1
+		frag = append(frag, edit...)
+		crc := crc32.Checksum(frag[6:], crc32.MakeTable(crc32.Castagnoli))
+		masked := (crc>>15 | crc<<17) + 0xa282ead8
+		binary.LittleEndian.PutUint32(frag[:4], masked)
+		// #nosec G703 -- mPath is inside t.TempDir() and manifest.File passed ValidateManifestName.
+		require.NoError(t, os.WriteFile(mPath, append(mData, frag...), 0o600))
+		expectedFile = "000005.ldb"
+	}
+
+	r, err := OpenFor(context.Background(), dir, slog.New(slog.DiscardHandler), ScopeMessages)
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+
+	damage := r.Damage()
+	files := make([]string, 0, len(damage))
+	for _, d := range damage {
+		files = append(files, d.File)
+	}
+	assert.Contains(t, files, expectedFile, "missing manifest table is reported by name")
+}
+
 func TestLogsStableAndMissingManifestTables(t *testing.T) {
 	t.Parallel()
 	// Normal append to an active log stays stable; shrinkage or rotation does not.
@@ -836,10 +938,111 @@ func TestLogsStableAndMissingManifestTables(t *testing.T) {
 		[]fileStamp{{name: "000011.log", size: 100}},
 	))
 
-	// Missing manifest-listed table makes copyOnce report unstable.
-	m := &leveldb.Manifest{Tables: map[uint64]leveldb.TableInfo{1: {Number: 1}, 2: {Number: 2}}}
-	assert.False(t, hasAllManifestTables(m, []fileStamp{{name: "000001.ldb", number: 1}}))
-	assert.True(t, hasAllManifestTables(m, []fileStamp{{name: "000001.ldb", number: 1}, {name: "000002.ldb", number: 2}}))
+	// checkManifestStamps detects missing tables, size mismatches, and missing PrevLogNumber.
+	m := &leveldb.Manifest{
+		PrevLogNumber: 8,
+		Tables: map[uint64]leveldb.TableInfo{
+			1: {Number: 1, Size: 500},
+			2: {Number: 2, Size: 200},
+		},
+	}
+	problems := checkManifestStamps(m, []fileStamp{{name: "000001.ldb", number: 1, size: 100}}, nil)
+	require.Len(t, problems, 3)
+	assert.Equal(t, "000001.ldb", problems[0].File)
+	assert.Contains(t, problems[0].Reason, "does not match manifest size")
+	assert.Equal(t, "000002.ldb", problems[1].File)
+	assert.Contains(t, problems[1].Reason, "missing table")
+	assert.Equal(t, "000008.log", problems[2].File)
+	assert.Contains(t, problems[2].Reason, "previous log")
+
+	assert.Empty(t, checkManifestStamps(
+		m,
+		[]fileStamp{{name: "000001.ldb", number: 1, size: 500}, {name: "000002.ldb", number: 2, size: 200}},
+		[]fileStamp{{name: "000008.log", number: 8, size: 10}},
+	))
+}
+
+func TestCopyDataFilesLiveLogGrowthAndRotation(t *testing.T) {
+	t.Parallel()
+	// Verify prefix copy captures a readable snapshot while an active log grows concurrently.
+	dir := filepath.Join(t.TempDir(), "live.leveldb")
+	require.NoError(t, idbtest.WriteTeamsSample(dir, time.Now()))
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var logPath string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".log") {
+			logPath = filepath.Join(dir, e.Name())
+			break
+		}
+	}
+	require.NotEmpty(t, logPath)
+
+	// Append valid zero-padding / batches concurrently while opening the cache.
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f, openErr := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if openErr != nil {
+			return
+		}
+		defer func() { _ = f.Close() }()
+		// Append small valid empty write-batch fragments to simulate active WAL growth.
+		payload := make([]byte, 12) // seq=0, count=0
+		frag := make([]byte, 7, 7+len(payload))
+		frag[4] = byte(len(payload))
+		frag[6] = 1
+		frag = append(frag, payload...)
+		crc := crc32.Checksum(frag[6:], crc32.MakeTable(crc32.Castagnoli))
+		masked := (crc>>15 | crc<<17) + 0xa282ead8
+		binary.LittleEndian.PutUint32(frag[:4], masked)
+		for range 20 {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = f.Write(frag)
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	r, err := OpenFor(context.Background(), dir, slog.New(slog.DiscardHandler), ScopeMessages)
+	close(stop)
+	<-done
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+	assert.Len(t, r.Messages(""), 2, "messages stay readable during concurrent log appends")
+
+	// Verify continuous log rotation causes instability reporting on a raw cache (no redundant 4th copy).
+	rawDir := filepath.Join(t.TempDir(), "rotating.leveldb")
+	require.NoError(t, os.MkdirAll(rawDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(rawDir, "000001.log"), []byte("a"), 0o600))
+	stopRot := make(chan struct{})
+	doneRot := make(chan struct{})
+	go func() {
+		defer close(doneRot)
+		for n := 2; ; n++ {
+			select {
+			case <-stopRot:
+				return
+			default:
+				name := filepath.Join(rawDir, fmt.Sprintf("%06d.log", n))
+				_ = os.WriteFile(name, []byte("x"), 0o600)
+				_ = os.Remove(filepath.Join(rawDir, fmt.Sprintf("%06d.log", n-1)))
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	dstRot := filepath.Join(t.TempDir(), "copy-rot")
+	stable, manifestErr, manifestDamage, err := copyDataFiles(context.Background(), rawDir, dstRot, slog.New(slog.DiscardHandler))
+	close(stopRot)
+	<-doneRot
+	require.NoError(t, err)
+	require.NoError(t, manifestErr)
+	assert.Empty(t, manifestDamage)
+	_ = stable
 }
 
 func TestDiscoverCachesMultipleOriginsInOneProfile(t *testing.T) {
