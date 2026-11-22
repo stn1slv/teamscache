@@ -731,3 +731,106 @@ func TestCopyOnceIsStableWhenNothingChanges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, entries, 2)
 }
+
+func TestIsTeamsOriginDir(t *testing.T) {
+	t.Parallel()
+	for name, want := range map[string]bool{
+		"https_teams.microsoft.com_0.indexeddb.leveldb":       true,
+		"https_teams.cloud.microsoft_0.indexeddb.leveldb":     true,
+		"https_teams.live.com_0.indexeddb.leveldb":            true,
+		"https_teams.microsoft.us_0.indexeddb.leveldb":        true,
+		"https_dod.teams.microsoft.us_0.indexeddb.leveldb":    true,
+		"https_teams.microsoftonline.cn_0.indexeddb.leveldb":  true,
+		"https_contoso-my.sharepoint.com_0.indexeddb.leveldb": false,
+		"https_evil-teams.microsoft.com_0.indexeddb.leveldb":  false,
+		"https_teams.microsoft.com_0.indexeddb.blob":          false,
+		"https_teams.microsoft.com_abc.indexeddb.leveldb":     false,
+	} {
+		assert.Equal(t, want, isTeamsOriginDir(name), name)
+	}
+}
+
+func TestDiscoverCachesFindsMultipleOriginsAndSkipsNonTeams(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LOCALAPPDATA", home)
+
+	makeOrigin := func(profile, origin string, mod time.Time) string {
+		var dir string
+		switch runtime.GOOS {
+		case "darwin":
+			dir = filepath.Join(home, "Library", "Containers", "com.microsoft.teams2", "Data", "Library",
+				"Application Support", "Microsoft", "MSTeams", "EBWebView", profile, "IndexedDB", origin)
+		case "windows":
+			dir = filepath.Join(home, "Packages", "MSTeams_test", "LocalCache", "Microsoft", "MSTeams",
+				"EBWebView", profile, "IndexedDB", origin)
+		default:
+			dir = filepath.Join(home, ".config", "teams", profile, "IndexedDB", origin)
+		}
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.Chtimes(dir, mod, mod))
+		return dir
+	}
+
+	makeOrigin("WV2Profile_tfl", "https_teams.live.com_0.indexeddb.leveldb", time.Now().Add(-2*time.Hour))
+	cloud := makeOrigin("WV2Profile_tfw", "https_teams.cloud.microsoft_0.indexeddb.leveldb", time.Now())
+	makeOrigin("WV2Profile_tfw", "https_contoso-my.sharepoint.com_0.indexeddb.leveldb", time.Now().Add(time.Hour))
+
+	caches := DiscoverCaches()
+	require.Len(t, caches, 2, "SharePoint origin is excluded")
+	assert.Equal(t, cloud, caches[0].Path)
+	assert.Equal(t, "WV2Profile_tfw", caches[0].Profile)
+	assert.Equal(t, "WV2Profile_tfl", caches[1].Profile)
+}
+
+func TestCopyDataFilesWithManifestSkipsObsoleteTables(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	src := filepath.Join(root, "cache.leveldb")
+	dst := filepath.Join(root, "copy")
+	require.NoError(t, idbtest.WriteTeamsSample(src, time.Now()))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "999999.ldb"), []byte("obsolete"), 0o600))
+
+	stable, err := copyDataFiles(context.Background(), src, dst, slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	assert.True(t, stable)
+	_, err = os.Stat(filepath.Join(dst, "CURRENT"))
+	require.NoError(t, err, "CURRENT is copied when manifest is valid")
+	_, err = os.Stat(filepath.Join(dst, "999999.ldb"))
+	assert.True(t, os.IsNotExist(err), "obsolete table not in manifest is skipped")
+}
+
+func TestUpdatedBlobRecordHasZeroSkipped(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, blobs := filepath.Join(root, "cache.leveldb"), filepath.Join(root, "cache.blob")
+	p := func(k string, v any) idbtest.Prop { return idbtest.Prop{Key: k, Value: v} }
+	chain := func(text string) idbtest.Obj {
+		return idbtest.Obj{p("conversationId", "c1"), p("messageMap", idbtest.Obj{
+			p("m1", idbtest.Obj{p("id", "m1"), p("content", text)}),
+		})}
+	}
+	require.NoError(t, idbtest.Write(dir, blobs, []idbtest.Database{{
+		Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+		Stores: []idbtest.Store{{Name: "replychains", Records: []idbtest.Record{
+			{Key: "r1", Wrapping: idbtest.Blob, Value: chain("short")},
+		}}},
+	}}))
+	require.NoError(t, idbtest.Write(dir, blobs, []idbtest.Database{{
+		Number: 1, Name: "Teams:replychain-manager:react-web-client:t:u:en-us",
+		Stores: []idbtest.Store{{Name: "replychains", Records: []idbtest.Record{
+			{Key: "r1", Wrapping: idbtest.Blob, Value: chain("much longer edited message text")},
+		}}},
+	}}))
+
+	r, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	t.Cleanup(r.Close)
+
+	msgs := r.Messages("")
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "much longer edited message text", msgs[0].Content)
+	assert.Zero(t, r.Skipped())
+	assert.Empty(t, r.Damage())
+}

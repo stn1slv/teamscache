@@ -130,6 +130,10 @@ func readLogBatches(ctx context.Context, data []byte) ([]logBatch, []logDamage, 
 // type (1 byte), varint-prefixed key and, for live entries, varint-prefixed
 // value. Entry i of a batch gets sequence number seq+i.
 func parseLog(ctx context.Context, data []byte, path string) ([]Record, []logDamage, error) {
+	return parseLogFiltered(ctx, data, path, nil)
+}
+
+func parseLogFiltered(ctx context.Context, data []byte, path string, keepRecord func([]byte) bool) ([]Record, []logDamage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -161,6 +165,9 @@ func parseLog(ctx context.Context, data []byte, path string) ([]Record, []logDam
 				break
 			}
 			pos += n
+			if keepRecord != nil && !keepRecord(key) {
+				continue
+			}
 			records = append(records, Record{
 				Key: key, Value: value, Seq: seq + uint64(i), State: state,
 				FileType: Log, File: path, Offset: b.offset + int64(start),

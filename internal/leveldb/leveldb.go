@@ -111,6 +111,19 @@ func IsDataFile(name string) bool {
 	return dataFilePattern.MatchString(name)
 }
 
+// ParseFileNumber parses the decimal number and kind of a LevelDB data file.
+func ParseFileNumber(name string) (number uint64, isLog, ok bool) {
+	if !IsDataFile(name) {
+		return 0, false, false
+	}
+	stem := strings.TrimSuffix(name, filepath.Ext(name))
+	number, err := strconv.ParseUint(stem, 10, 64)
+	if err != nil {
+		return 0, false, false
+	}
+	return number, strings.HasSuffix(name, ".log"), true
+}
+
 type dataFile struct {
 	path   string
 	number uint64
@@ -136,13 +149,28 @@ type fileResult struct {
 	err      error
 }
 
-func parseDataFile(ctx context.Context, f dataFile) fileResult {
+// ReadOptions controls which files, table blocks, and records ReadDirOptions
+// reads. Nil callbacks accept everything.
+type ReadOptions struct {
+	// KeepFile reports whether a data file should be read.
+	KeepFile func(number uint64, isLog bool) bool
+	// KeepBlock reports whether a table data block should be decompressed and
+	// decoded. prevUserKey is nil for the first block of a table; otherwise it
+	// is the user key of the previous index entry. userKey is the user key of
+	// the current index entry. Under the table's comparator, every key in the
+	// block lies in [prevUserKey, userKey].
+	KeepBlock func(prevUserKey, userKey []byte) bool
+	// KeepRecord reports whether a decoded record should be retained.
+	KeepRecord func(userKey []byte) bool
+}
+
+func parseDataFile(ctx context.Context, f dataFile, opts ReadOptions) fileResult {
 	data, err := readFile(ctx, f.path)
 	if err != nil {
 		return fileResult{err: fmt.Errorf("read %s: %w", f.path, err)}
 	}
 	if f.isLog {
-		recs, sections, err := parseLog(ctx, data, f.path)
+		recs, sections, err := parseLogFiltered(ctx, data, f.path, opts.KeepRecord)
 		if err != nil {
 			return fileResult{err: err}
 		}
@@ -157,7 +185,7 @@ func parseDataFile(ctx context.Context, f dataFile) fileResult {
 		}
 		return res
 	}
-	recs, sections, err := parseTable(ctx, data, f.path)
+	recs, sections, err := parseTableFiltered(ctx, data, f.path, opts)
 	if ctx.Err() != nil {
 		return fileResult{err: ctx.Err()}
 	}
@@ -229,6 +257,12 @@ func parseFiles(ctx context.Context, files []dataFile, parse func(context.Contex
 // does not hide the rest of the data.
 // It stops with the context's error when ctx is canceled.
 func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, []Damage, error) {
+	return ReadDirOptions(ctx, dir, logger, ReadOptions{})
+}
+
+// ReadDirOptions works like ReadDir, applying opts to filter files, table
+// blocks, and records.
+func ReadDirOptions(ctx context.Context, dir string, logger *slog.Logger, opts ReadOptions) ([]Record, []Damage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -238,24 +272,28 @@ func ReadDir(ctx context.Context, dir string, logger *slog.Logger) ([]Record, []
 	}
 	var files []dataFile
 	for _, e := range entries {
-		name := e.Name()
-		if !e.Type().IsRegular() || !IsDataFile(name) {
+		if !e.Type().IsRegular() {
 			continue
 		}
-		stem := strings.TrimSuffix(name, filepath.Ext(name))
-		number, err := strconv.ParseUint(stem, 10, 64)
-		if err != nil {
+		name := e.Name()
+		number, isLog, ok := ParseFileNumber(name)
+		if !ok {
+			continue
+		}
+		if opts.KeepFile != nil && !opts.KeepFile(number, isLog) {
 			continue
 		}
 		files = append(files, dataFile{
 			path:   filepath.Join(dir, name),
 			number: number,
-			isLog:  strings.HasSuffix(name, ".log"),
+			isLog:  isLog,
 		})
 	}
 	sort.SliceStable(files, func(i, j int) bool { return files[i].number < files[j].number })
 
-	results, err := parseFiles(ctx, files, parseDataFile)
+	results, err := parseFiles(ctx, files, func(ctx context.Context, f dataFile) fileResult {
+		return parseDataFile(ctx, f, opts)
+	})
 	if err != nil {
 		return nil, nil, err
 	}

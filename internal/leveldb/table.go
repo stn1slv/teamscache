@@ -51,6 +51,10 @@ func readBlockHandle(data []byte) (blockHandle, int, error) {
 // parseTable skips damaged data blocks and continues through the index.
 // An unreadable footer or index is a file-level error.
 func parseTable(ctx context.Context, data []byte, path string) ([]Record, []Damage, error) {
+	return parseTableFiltered(ctx, data, path, ReadOptions{})
+}
+
+func parseTableFiltered(ctx context.Context, data []byte, path string, opts ReadOptions) ([]Record, []Damage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -83,10 +87,21 @@ func parseTable(ctx context.Context, data []byte, path string) ([]Record, []Dama
 	}
 
 	var records []Record
+	var prevSep []byte
 	for _, ie := range indexEntries {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
+		var curSep []byte
+		if len(ie.key) >= 8 {
+			curSep = ie.key[:len(ie.key)-8]
+		}
+		if opts.KeepBlock != nil && curSep != nil && !opts.KeepBlock(prevSep, curSep) {
+			prevSep = curSep
+			continue
+		}
+		prevSep = curSep
+
 		handle, _, err := readBlockHandle(ie.value)
 		if err != nil {
 			damage = append(damage, blockDamage(data, path, indexHandle, err))
@@ -99,6 +114,15 @@ func parseTable(ctx context.Context, data []byte, path string) ([]Record, []Dama
 		}
 		entries, err := blockEntries(ctx, block)
 		for _, e := range entries {
+			if opts.KeepRecord != nil {
+				uk := e.key
+				if len(uk) >= 8 {
+					uk = uk[:len(uk)-8]
+				}
+				if !opts.KeepRecord(uk) {
+					continue
+				}
+			}
 			offset := int64(handle.offset)
 			if !compressed {
 				offset += int64(e.offset)

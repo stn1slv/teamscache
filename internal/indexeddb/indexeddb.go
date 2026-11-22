@@ -9,8 +9,11 @@ package indexeddb
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"slices"
 	"sort"
@@ -27,6 +30,7 @@ const (
 	databaseNamePrefixByte = 0xc9
 	indexObjectStoreData   = 1
 	indexBlobEntry         = 3
+	idbComparatorName      = "idb_cmp1"
 )
 
 // DatabaseID identifies one database of an origin.
@@ -47,17 +51,23 @@ type indexedRecord struct {
 
 // DB is an IndexedDB LevelDB, read into memory.
 type DB struct {
-	ctx       context.Context
-	damage    []leveldb.Damage
-	records   []leveldb.Record
-	blobDir   string
-	databases []DatabaseID
+	ctx          context.Context
+	dir          string
+	logger       *slog.Logger
+	manifest     *leveldb.Manifest
+	lazyStores   bool
+	loadedStores map[storeAddr]bool
+	damage       []leveldb.Damage
+	damageSeen   map[leveldb.Damage]bool
+	records      []leveldb.Record
+	blobDir      string
+	databases    []DatabaseID
 	// maxStoreID[db] is the highest object store id of a database.
 	maxStoreID map[uint64]uint64
 	// storeNames[db][store] is the name of an object store.
-	storeNames map[uint64]map[uint64]string
-	storeIndex map[storeAddr][]indexedRecord
-	blobInfo   map[blobKey]blobInfo
+	storeNames  map[uint64]map[uint64]string
+	storeIndex  map[storeAddr][]indexedRecord
+	blobEntries map[recordKey]blobEntry
 }
 
 // Open reads all records of the LevelDB in dir. blobDir is the folder that
@@ -67,7 +77,8 @@ func Open(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, e
 	if err != nil {
 		return nil, err
 	}
-	db := &DB{ctx: ctx, records: records, blobDir: blobDir, damage: damage}
+	db := &DB{ctx: ctx, dir: dir, logger: logger, records: records, blobDir: blobDir}
+	db.addDamage(damage)
 	db.readMetadata()
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -75,8 +86,269 @@ func Open(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, e
 	return db, nil
 }
 
+// OpenLive opens dir using CURRENT and the active MANIFEST when available,
+// skipping obsolete table and log files. For Chromium idb_cmp1 stores, it
+// reads only metadata on OpenLive and loads object stores on demand via
+// LoadStores. When CURRENT or the manifest is missing or unreadable, it falls
+// back to reading all data files.
+func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	manifest, err := leveldb.ReadManifest(ctx, dir)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		db, openErr := Open(ctx, dir, blobDir, logger)
+		if openErr != nil {
+			return nil, openErr
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			logger.Warn("manifest unreadable; fell back to scanning all leveldb files", "dir", dir, "error", err)
+			db.addDamage([]leveldb.Damage{{File: "CURRENT", Reason: err.Error()}})
+		}
+		return db, nil
+	}
+
+	if manifest.Comparator == idbComparatorName {
+		opts := leveldb.ReadOptions{
+			KeepFile: func(number uint64, isLog bool) bool {
+				if isLog {
+					return manifest.IsActiveLog(number)
+				}
+				ti, ok := manifest.Tables[number]
+				return ok && overlapsMetadata(ti.SmallestUserKey(), ti.LargestUserKey())
+			},
+			KeepBlock:  overlapsMetadata,
+			KeepRecord: isMetadataKey,
+		}
+		records, damage, err := leveldb.ReadDirOptions(ctx, dir, logger, opts)
+		if err != nil {
+			return nil, err
+		}
+		db := &DB{
+			ctx:          ctx,
+			dir:          dir,
+			logger:       logger,
+			manifest:     manifest,
+			lazyStores:   true,
+			loadedStores: map[storeAddr]bool{},
+			records:      records,
+			blobDir:      blobDir,
+		}
+		db.addDamage(damage)
+		db.readMetadata()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return db, nil
+	}
+
+	opts := leveldb.ReadOptions{
+		KeepFile: func(number uint64, isLog bool) bool {
+			if isLog {
+				return manifest.IsActiveLog(number)
+			}
+			return manifest.IsActiveTable(number)
+		},
+	}
+	records, damage, err := leveldb.ReadDirOptions(ctx, dir, logger, opts)
+	if err != nil {
+		return nil, err
+	}
+	db := &DB{ctx: ctx, dir: dir, logger: logger, manifest: manifest, records: records, blobDir: blobDir}
+	db.addDamage(damage)
+	db.readMetadata()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+// LoadStores loads object store data and blob entries for unloaded stores
+// accepted by accept. A nil accept loads all stores. When the database was not
+// opened lazily, LoadStores is a no-op.
+func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint64) bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !db.lazyStores {
+		return nil
+	}
+	needed := map[storeAddr]bool{}
+	var targets []storeAddr
+	for _, d := range db.databases {
+		maxID := db.maxStoreID[d.Number]
+		for storeID := range db.storeNames[d.Number] {
+			if storeID < 1 || storeID > maxID {
+				continue
+			}
+			addr := storeAddr{db: d.Number, store: storeID}
+			if db.loadedStores[addr] {
+				continue
+			}
+			if accept == nil || accept(d.Number, storeID) {
+				needed[addr] = true
+				targets = append(targets, addr)
+			}
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	slices.SortFunc(targets, func(a, b storeAddr) int {
+		if c := cmp.Compare(a.db, b.db); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.store, b.store)
+	})
+
+	opts := leveldb.ReadOptions{
+		KeepFile: func(number uint64, isLog bool) bool {
+			if isLog {
+				return db.manifest.IsActiveLog(number)
+			}
+			ti, ok := db.manifest.Tables[number]
+			return ok && overlapsStores(ti.SmallestUserKey(), ti.LargestUserKey(), targets)
+		},
+		KeepBlock: func(prevUserKey, userKey []byte) bool {
+			return overlapsStores(prevUserKey, userKey, targets)
+		},
+		KeepRecord: func(userKey []byte) bool {
+			dbID, storeID, indexID, _, ok := readPrefix(userKey)
+			if !ok || (indexID != indexObjectStoreData && indexID != indexBlobEntry) {
+				return false
+			}
+			return needed[storeAddr{db: dbID, store: storeID}]
+		},
+	}
+	records, damage, err := leveldb.ReadDirOptions(ctx, db.dir, db.logger, opts)
+	if err != nil {
+		return err
+	}
+	db.addDamage(damage)
+	if db.storeIndex == nil {
+		db.storeIndex = map[storeAddr][]indexedRecord{}
+	}
+	base := len(db.records)
+	db.records = append(db.records, records...)
+	for i := range records {
+		dbID, storeID, indexID, n, ok := readPrefix(records[i].UserKey())
+		if !ok || indexID != indexObjectStoreData {
+			continue
+		}
+		addr := storeAddr{db: dbID, store: storeID}
+		db.storeIndex[addr] = append(db.storeIndex[addr], indexedRecord{idx: base + i, prefixLen: n})
+	}
+	for _, addr := range targets {
+		db.loadedStores[addr] = true
+	}
+	db.blobEntries = nil
+	return ctx.Err()
+}
+
+func (db *DB) addDamage(sections []leveldb.Damage) {
+	if len(sections) == 0 {
+		return
+	}
+	if db.damageSeen == nil {
+		db.damageSeen = make(map[leveldb.Damage]bool, len(sections))
+	}
+	for _, d := range sections {
+		if db.damageSeen[d] {
+			continue
+		}
+		db.damageSeen[d] = true
+		db.damage = append(db.damage, d)
+	}
+}
+
+type keyPrefix struct {
+	db, store, index uint64
+}
+
+func comparePrefix(a, b keyPrefix) int {
+	if c := cmp.Compare(a.db, b.db); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.store, b.store); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.index, b.index)
+}
+
+func parseKeyPrefix(b []byte) (keyPrefix, bool) {
+	dbID, storeID, indexID, _, ok := readPrefix(b)
+	return keyPrefix{db: dbID, store: storeID, index: indexID}, ok
+}
+
+func isMetadataKey(userKey []byte) bool {
+	if bytes.HasPrefix(userKey, []byte{0, 0, 0, 0}) {
+		return true
+	}
+	dbID, storeID, _, _, ok := readPrefix(userKey)
+	return ok && (dbID == 0 || storeID == 0)
+}
+
+// overlapsMetadata reports whether an idb_cmp1 key range [lo, hi] can contain
+// any global or database metadata key (db == 0 or store == 0).
+func overlapsMetadata(loKey, hiKey []byte) bool {
+	if len(loKey) == 0 || len(hiKey) == 0 {
+		return true
+	}
+	lo, okLo := parseKeyPrefix(loKey)
+	hi, okHi := parseKeyPrefix(hiKey)
+	if !okLo || !okHi {
+		return true
+	}
+	if lo.db == 0 || lo.store == 0 || hi.db > lo.db {
+		return true
+	}
+	return false
+}
+
+// overlapsStores reports whether an idb_cmp1 key range [lo, hi] can contain
+// object store data (index 1) or blob entries (index 3) for any target store.
+func overlapsStores(loKey, hiKey []byte, targets []storeAddr) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	var lo, hi keyPrefix
+	hasLo, hasHi := false, false
+	if len(loKey) > 0 {
+		var ok bool
+		lo, ok = parseKeyPrefix(loKey)
+		if !ok {
+			return true
+		}
+		hasLo = true
+	}
+	if len(hiKey) > 0 {
+		var ok bool
+		hi, ok = parseKeyPrefix(hiKey)
+		if !ok {
+			return true
+		}
+		hasHi = true
+	}
+	for _, t := range targets {
+		if hasLo && comparePrefix(lo, keyPrefix{db: t.db, store: t.store, index: indexBlobEntry}) > 0 {
+			continue
+		}
+		if hasHi && comparePrefix(keyPrefix{db: t.db, store: t.store, index: indexObjectStoreData}, hi) > 0 {
+			break
+		}
+		return true
+	}
+	return false
+}
+
 // Damage returns the file sections skipped while reading LevelDB.
 func (db *DB) Damage() []leveldb.Damage {
+	if db.damage == nil {
+		return []leveldb.Damage{}
+	}
 	return db.damage
 }
 
@@ -88,15 +360,20 @@ func (db *DB) BlobFiles() []string {
 // BlobFilesFor lists referenced blob files relative to the blob directory for
 // stores accepted by accept. A nil accept matches all stores.
 func (db *DB) BlobFilesFor(accept func(dbNumber, storeID uint64) bool) []string {
-	if db.blobInfo == nil {
+	if db.blobEntries == nil {
 		db.loadBlobInfo()
 	}
 	seen := map[string]bool{}
-	for key, info := range db.blobInfo {
+	for key, entry := range db.blobEntries {
 		if accept != nil && !accept(key.db, key.store) {
 			continue
 		}
-		seen[blobPath("", key.db, info.number)] = true
+		for _, info := range entry.infos {
+			if info.kind != externalObjectBlob && info.kind != externalObjectFile {
+				continue
+			}
+			seen[blobPath("", key.db, info.number)] = true
+		}
 	}
 	files := make([]string, 0, len(seen))
 	for path := range seen {

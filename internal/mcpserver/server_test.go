@@ -207,7 +207,14 @@ func TestEveryToolReportsPartialResults(t *testing.T) {
 			{Key: "bad", Value: "bad", Wrapping: idbtest.Corrupt},
 		}}},
 	}}))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "999999.ldb"), []byte("corrupt"), 0o600))
+	logs, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	require.NoError(t, err)
+	require.NotEmpty(t, logs)
+	activeLog := logs[len(logs)-1]
+	raw, err := os.ReadFile(activeLog)
+	require.NoError(t, err)
+	// #nosec G703 -- activeLog comes from filepath.Glob inside t.TempDir.
+	require.NoError(t, os.WriteFile(activeLog, append(raw, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), 0o600))
 	session := connectCache(t, "", dir)
 	for _, name := range []string{
 		"list_accounts", "list_conversations", "read_conversation", "search_messages",
@@ -234,7 +241,7 @@ func TestEveryToolReportsPartialResults(t *testing.T) {
 		assert.True(t, diagnostics.Partial, name)
 		assert.Equal(t, 1, diagnostics.SkippedRecords, name)
 		require.Len(t, diagnostics.DamagedSections, 1, name)
-		assert.Equal(t, "999999.ldb", diagnostics.DamagedSections[0]["file"], name)
+		assert.Equal(t, filepath.Base(activeLog), diagnostics.DamagedSections[0]["file"], name)
 	}
 }
 

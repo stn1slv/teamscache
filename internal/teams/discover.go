@@ -10,7 +10,53 @@ import (
 	"time"
 )
 
-const leveldbName = "https_teams.microsoft.com_0.indexeddb.leveldb"
+const (
+	leveldbName   = "https_teams.microsoft.com_0.indexeddb.leveldb"
+	leveldbGlob   = "*.indexeddb.leveldb"
+	leveldbSuffix = ".indexeddb.leveldb"
+)
+
+// teamsOriginHosts are the known Microsoft Teams hostnames (and their
+// subdomains) whose IndexedDB folders hold Teams caches.
+var teamsOriginHosts = []string{
+	"teams.microsoft.com",
+	"teams.cloud.microsoft",
+	"teams.live.com",
+	"teams.microsoft.us",
+	"teams.microsoftonline.cn",
+}
+
+// isTeamsOriginDir reports whether a folder name under IndexedDB belongs to a
+// known Microsoft Teams origin.
+func isTeamsOriginDir(name string) bool {
+	stem, ok := strings.CutSuffix(strings.ToLower(name), leveldbSuffix)
+	if !ok {
+		return false
+	}
+	if rest, ok := strings.CutPrefix(stem, "https_"); ok {
+		stem = rest
+	} else if rest, ok := strings.CutPrefix(stem, "http_"); ok {
+		stem = rest
+	} else {
+		return false
+	}
+	idx := strings.LastIndexByte(stem, '_')
+	if idx <= 0 || idx == len(stem)-1 {
+		return false
+	}
+	for i := idx + 1; i < len(stem); i++ {
+		if stem[i] < '0' || stem[i] > '9' {
+			return false
+		}
+	}
+	host := stem[:idx]
+	for _, allowed := range teamsOriginHosts {
+		if host == allowed || strings.HasSuffix(host, "."+allowed) {
+			return true
+		}
+	}
+	return false
+}
 
 // DiscoveredCache is one Teams IndexedDB folder found on this computer.
 type DiscoveredCache struct {
@@ -27,17 +73,17 @@ func DefaultCacheGlobs() []string {
 	case "darwin":
 		base := filepath.Join(home, "Library", "Containers", "com.microsoft.teams2", "Data", "Library",
 			"Application Support", "Microsoft", "MSTeams", "EBWebView")
-		return []string{filepath.Join(base, "*", "IndexedDB", leveldbName)}
+		return []string{filepath.Join(base, "*", "IndexedDB", leveldbGlob)}
 	case "windows":
 		local := os.Getenv("LOCALAPPDATA")
 		if local == "" {
 			local = filepath.Join(home, "AppData", "Local")
 		}
 		return []string{filepath.Join(local, "Packages", "MSTeams_*", "LocalCache", "Microsoft", "MSTeams",
-			"EBWebView", "*", "IndexedDB", leveldbName)}
+			"EBWebView", "*", "IndexedDB", leveldbGlob)}
 	default:
 		// Unofficial Linux clients, best effort.
-		return []string{filepath.Join(home, ".config", "*eams*", "*", "IndexedDB", leveldbName)}
+		return []string{filepath.Join(home, ".config", "*eams*", "*", "IndexedDB", leveldbGlob)}
 	}
 }
 
@@ -49,6 +95,9 @@ func DiscoverCaches() []DiscoveredCache {
 		hits, _ := filepath.Glob(pattern)
 		sort.Strings(hits)
 		for _, hit := range hits {
+			if !isTeamsOriginDir(filepath.Base(hit)) {
+				continue
+			}
 			changed, ok := lastChange(hit)
 			if !ok {
 				continue
