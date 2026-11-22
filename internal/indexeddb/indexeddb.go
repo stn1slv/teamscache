@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -63,9 +62,11 @@ type DB struct {
 	logger       *slog.Logger
 	manifest     *leveldb.Manifest
 	lazyStores   bool
-	loadMu       sync.Mutex
+	loadSemOnce  sync.Once
+	loadSem      chan struct{}
 	mu           sync.RWMutex
 	loadedStores map[storeAddr]bool
+	failedStores map[storeAddr]error
 	logRecords   []leveldb.Record
 	damage       []leveldb.Damage
 	damageSeen   map[leveldb.Damage]bool
@@ -88,17 +89,50 @@ func (db *DB) ctxErr() error {
 	return db.ctx.Err()
 }
 
-// mergeContext returns a context that is canceled when either ctx or other is
-// canceled.
+func (db *DB) acquireLoadLock(ctx context.Context) error {
+	db.loadSemOnce.Do(func() {
+		db.loadSem = make(chan struct{}, 1)
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	select {
+	case db.loadSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (db *DB) releaseLoadLock() {
+	<-db.loadSem
+}
+
+// mergeContext returns a non-nil context that is canceled synchronously if
+// either ctx or other is already canceled, or as soon as either cancels later.
 func mergeContext(ctx, other context.Context) (context.Context, context.CancelFunc) {
-	if other == nil || other == ctx || other.Done() == nil {
-		return ctx, func() {}
+	if ctx == nil && other == nil {
+		return context.Background(), func() {}
 	}
 	if ctx == nil {
 		return other, func() {}
 	}
+	if other == nil || other == ctx || other.Done() == nil {
+		return ctx, func() {}
+	}
+	if ctx.Err() != nil {
+		return ctx, func() {}
+	}
+	if other.Err() != nil {
+		return other, func() {}
+	}
 	merged, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(other, cancel)
+	if other.Err() != nil {
+		cancel()
+	}
 	return merged, func() {
 		stop()
 		cancel()
@@ -120,78 +154,6 @@ func Open(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*DB, e
 		return nil, err
 	}
 	return db, nil
-}
-
-// checkManifestFiles verifies that every table listed in manifest is present as
-// a regular file in dir with the expected size, and that a nonzero
-// PrevLogNumber log file exists.
-func checkManifestFiles(dir string, manifest *leveldb.Manifest) ([]leveldb.Damage, error) {
-	if len(manifest.Tables) == 0 && manifest.PrevLogNumber == 0 {
-		return nil, nil
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("read leveldb directory: %w", err)
-	}
-	type fileMeta struct {
-		name string
-		size int64
-	}
-	presentTables := make(map[uint64]fileMeta, len(entries))
-	presentLogs := make(map[uint64]bool, len(entries))
-	for _, e := range entries {
-		if !e.Type().IsRegular() {
-			continue
-		}
-		num, isLog, ok := leveldb.ParseFileNumber(e.Name())
-		if !ok {
-			continue
-		}
-		if isLog {
-			presentLogs[num] = true
-			continue
-		}
-		info, infoErr := e.Info()
-		if errors.Is(infoErr, fs.ErrNotExist) {
-			continue
-		}
-		if infoErr != nil {
-			return nil, fmt.Errorf("stat leveldb table %s: %w", e.Name(), infoErr)
-		}
-		presentTables[num] = fileMeta{name: e.Name(), size: info.Size()}
-	}
-
-	tableNums := make([]uint64, 0, len(manifest.Tables))
-	for num := range manifest.Tables {
-		tableNums = append(tableNums, num)
-	}
-	slices.Sort(tableNums)
-
-	var problems []leveldb.Damage
-	for _, num := range tableNums {
-		ti := manifest.Tables[num]
-		meta, ok := presentTables[num]
-		if !ok {
-			problems = append(problems, leveldb.Damage{
-				File:   fmt.Sprintf("%06d.ldb", num),
-				Reason: "manifest references missing table file",
-			})
-			continue
-		}
-		if ti.Size > 0 && (meta.size < 0 || uint64(meta.size) != ti.Size) {
-			problems = append(problems, leveldb.Damage{
-				File:   meta.name,
-				Reason: fmt.Sprintf("table file size %d does not match manifest size %d", meta.size, ti.Size),
-			})
-		}
-	}
-	if manifest.PrevLogNumber != 0 && !presentLogs[manifest.PrevLogNumber] {
-		problems = append(problems, leveldb.Damage{
-			File:   fmt.Sprintf("%06d.log", manifest.PrevLogNumber),
-			Reason: "manifest references missing previous log file",
-		})
-	}
-	return problems, nil
 }
 
 // OpenLive opens dir using CURRENT and the active MANIFEST when available,
@@ -223,7 +185,7 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 		return db, nil
 	}
 
-	problems, err := checkManifestFiles(dir, manifest)
+	problems, err := leveldb.ValidateManifestDir(dir, manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -276,6 +238,7 @@ func OpenLive(ctx context.Context, dir, blobDir string, logger *slog.Logger) (*D
 			manifest:     manifest,
 			lazyStores:   true,
 			loadedStores: map[storeAddr]bool{},
+			failedStores: map[storeAddr]error{},
 			logRecords:   logRecords,
 			records:      metaRecords,
 			blobDir:      blobDir,
@@ -324,27 +287,45 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 		return nil
 	}
 
-	db.loadMu.Lock()
-	defer db.loadMu.Unlock()
-
+	// Snapshot store metadata and evaluate caller callback outside internal locks
+	// so reentrant DB calls inside accept cannot deadlock.
 	db.mu.RLock()
-	needed := map[storeAddr]bool{}
-	var targets []storeAddr
+	var candidates []storeAddr
 	for _, d := range db.databases {
 		maxID := db.maxStoreID[d.Number]
 		for storeID := range db.storeNames[d.Number] {
 			if storeID < 1 || storeID > maxID {
 				continue
 			}
-			addr := storeAddr{db: d.Number, store: storeID}
-			if db.loadedStores[addr] {
-				continue
-			}
-			if accept == nil || accept(d.Number, storeID) {
-				needed[addr] = true
-				targets = append(targets, addr)
-			}
+			candidates = append(candidates, storeAddr{db: d.Number, store: storeID})
 		}
+	}
+	db.mu.RUnlock()
+
+	accepted := make([]storeAddr, 0, len(candidates))
+	for _, addr := range candidates {
+		if accept == nil || accept(addr.db, addr.store) {
+			accepted = append(accepted, addr)
+		}
+	}
+	if len(accepted) == 0 {
+		return loadCtx.Err()
+	}
+
+	if err := db.acquireLoadLock(loadCtx); err != nil {
+		return err
+	}
+	defer db.releaseLoadLock()
+
+	db.mu.RLock()
+	needed := map[storeAddr]bool{}
+	var targets []storeAddr
+	for _, addr := range accepted {
+		if db.loadedStores[addr] {
+			continue
+		}
+		needed[addr] = true
+		targets = append(targets, addr)
 	}
 	db.mu.RUnlock()
 	if len(targets) == 0 {
@@ -363,6 +344,7 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 			expectedTables[num] = true
 		}
 	}
+	// KeepFile runs sequentially on the calling goroutine before worker goroutines start.
 	seenTables := make(map[uint64]bool, len(expectedTables))
 
 	matchRecord := func(userKey []byte) bool {
@@ -392,6 +374,12 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 	if err != nil {
 		if loadCtx.Err() != nil {
 			return loadCtx.Err()
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			db.addDamage([]leveldb.Damage{{
+				File:   filepath.Base(db.dir),
+				Reason: err.Error(),
+			}})
 		}
 		return err
 	}
@@ -455,6 +443,7 @@ func (db *DB) LoadStores(ctx context.Context, accept func(dbNumber, storeID uint
 	}
 	for _, addr := range targets {
 		db.loadedStores[addr] = true
+		delete(db.failedStores, addr)
 	}
 	return nil
 }
@@ -595,18 +584,28 @@ func (db *DB) BlobFilesFor(accept func(dbNumber, storeID uint64) bool) []string 
 		}
 	}
 	db.ensureBlobInfo()
+
+	type blobRef struct {
+		db, store uint64
+		infos     []blobInfo
+	}
 	db.mu.RLock()
-	defer db.mu.RUnlock()
-	seen := map[string]bool{}
+	refs := make([]blobRef, 0, len(db.blobEntries))
 	for key, entry := range db.blobEntries {
-		if accept != nil && !accept(key.db, key.store) {
+		refs = append(refs, blobRef{db: key.db, store: key.store, infos: entry.infos})
+	}
+	db.mu.RUnlock()
+
+	seen := map[string]bool{}
+	for _, ref := range refs {
+		if accept != nil && !accept(ref.db, ref.store) {
 			continue
 		}
-		for _, info := range entry.infos {
+		for _, info := range ref.infos {
 			if info.kind != externalObjectBlob && info.kind != externalObjectFile {
 				continue
 			}
-			seen[blobPath("", key.db, info.number)] = true
+			seen[blobPath("", ref.db, info.number)] = true
 		}
 	}
 	files := make([]string, 0, len(seen))

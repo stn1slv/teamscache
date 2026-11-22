@@ -10,9 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
+
+	"github.com/golang/snappy"
 
 	"github.com/stn1slv/teamscache/internal/leveldb"
 	"github.com/stn1slv/teamscache/internal/v8"
@@ -60,6 +63,8 @@ type Record struct {
 }
 
 // ensureStoreLoaded loads the store on demand when db was opened lazily.
+// A non-cancellation load failure is remembered per store so repeated reads do
+// not retry or report the same error again.
 func (db *DB) ensureStoreLoaded(dbNumber, storeID uint64, onBad func(error)) bool {
 	if !db.lazyStores {
 		return true
@@ -67,17 +72,28 @@ func (db *DB) ensureStoreLoaded(dbNumber, storeID uint64, onBad func(error)) boo
 	addr := storeAddr{db: dbNumber, store: storeID}
 	db.mu.RLock()
 	loaded := db.loadedStores[addr]
+	failed := db.failedStores[addr] != nil
 	db.mu.RUnlock()
 	if loaded {
 		return true
 	}
+	if failed {
+		return false
+	}
 	if err := db.LoadStores(db.ctx, func(d, s uint64) bool { return d == dbNumber && s == storeID }); err != nil {
 		if db.ctxErr() == nil {
-			db.addDamage([]leveldb.Damage{{
-				File:   filepath.Base(db.dir),
-				Reason: fmt.Sprintf("load store %d/%d: %v", dbNumber, storeID, err),
+			db.mu.Lock()
+			if db.failedStores == nil {
+				db.failedStores = map[storeAddr]error{}
+			}
+			firstFailure := db.failedStores[addr] == nil
+			db.failedStores[addr] = err
+			db.addDamageLocked([]leveldb.Damage{{
+				File:   fmt.Sprintf("store %d/%d", dbNumber, storeID),
+				Reason: fmt.Sprintf("load store failed: %v", err),
 			}})
-			if onBad != nil {
+			db.mu.Unlock()
+			if firstFailure && onBad != nil {
 				onBad(err)
 			}
 		}
@@ -134,7 +150,7 @@ func (db *DB) Records(dbNumber, storeID uint64, onBad func(error)) iter.Seq[Reco
 				onBad(recordError(r, err))
 				continue
 			}
-			rec := db.decodeRecord(dbNumber, storeID, r, userKey[entry.prefixLen:entry.prefixLen+keyLen])
+			rec := db.decodeRecordSafe(dbNumber, storeID, r, userKey[entry.prefixLen:entry.prefixLen+keyLen])
 			if db.ctxErr() != nil {
 				return
 			}
@@ -209,7 +225,7 @@ func (db *DB) CurrentRecords(dbNumber, storeID uint64, onBad func(error)) iter.S
 				if db.ctxErr() != nil {
 					return
 				}
-				rec := db.decodeRecord(dbNumber, storeID, c.rec, c.key)
+				rec := db.decodeRecordSafe(dbNumber, storeID, c.rec, c.key)
 				if db.ctxErr() != nil {
 					return
 				}
@@ -280,8 +296,9 @@ func (db *DB) CurrentRecords(dbNumber, storeID uint64, onBad func(error)) iter.S
 	}
 }
 
-// estimatedRecordBytes returns an approximate byte cost for budgeting a
-// parallel decode window, accounting for declared external blob sizes.
+// estimatedRecordBytes returns an approximate decoded byte cost for budgeting
+// a parallel decode window, accounting for declared Snappy expansion and
+// external blob sizes.
 func estimatedRecordBytes(value []byte) int {
 	est := len(value)
 	_, n := leveldb.Uvarint(value, 10)
@@ -293,19 +310,30 @@ func estimatedRecordBytes(value []byte) int {
 		return max(est, 1)
 	}
 	ver, m := leveldb.Uvarint(buf[1:], 10)
-	if m == 0 || ver != blinkWrappedPseudoVer || 1+m >= len(buf) || buf[1+m] != blinkReplaceWithBlob {
+	if m == 0 || ver != blinkWrappedPseudoVer || 1+m >= len(buf) {
 		return max(est, 1)
 	}
-	blobSize, k := leveldb.Uvarint(buf[2+m:], 10)
-	if k > 0 {
-		est += int(min(blobSize, uint64(parallelDecodeWindowBytes)))
+	switch buf[1+m] {
+	case blinkReplaceWithBlob:
+		if blobSize, k := leveldb.Uvarint(buf[2+m:], 10); k > 0 {
+			est += int(min(blobSize, uint64(parallelDecodeWindowBytes)))
+		}
+	case blinkCompressedSnappy:
+		if decodedLen, err := snappy.DecodedLen(buf[2+m:]); err == nil && decodedLen > 0 {
+			est += min(decodedLen, parallelDecodeWindowBytes)
+		}
 	}
-	return max(est, 1)
+	// Account for Go object allocation overhead beyond raw serialized bytes.
+	return min(max(est*2, 1), parallelDecodeWindowBytes)
 }
 
 func (db *DB) decodeRecordSafe(dbNumber, storeID uint64, r *leveldb.Record, key []byte) (rec Record) {
 	defer func() {
 		if p := recover(); p != nil {
+			if db.logger != nil {
+				db.logger.Error("panic while decoding indexeddb record",
+					"file", filepath.Base(r.File), "offset", r.Offset, "panic", p, "stack", string(debug.Stack()))
+			}
 			rec = Record{
 				Key:    key,
 				Live:   r.State == leveldb.Live,
@@ -384,7 +412,7 @@ func (db *DB) decodeEnvelope(dbNumber, storeID uint64, key, buf []byte, depth in
 			if size > leveldb.MaxDecodedSize {
 				return nil, fmt.Errorf("%w: blob declares %d bytes", ErrBadValue, size)
 			}
-			blob, err := db.readBlob(dbNumber, storeID, key, index)
+			blob, err := db.readBlob(dbNumber, storeID, key, index, size)
 			if err != nil {
 				return nil, err
 			}
@@ -498,8 +526,9 @@ type parsedBlobRecord struct {
 	entry blobEntry
 }
 
-// readBlob returns the content of an external value.
-func (db *DB) readBlob(dbNumber, storeID uint64, key []byte, index uint64) ([]byte, error) {
+// readBlob returns the content of an external value after checking that the
+// file size on disk matches expectedSize and stays within MaxDecodedSize.
+func (db *DB) readBlob(dbNumber, storeID uint64, key []byte, index, expectedSize uint64) ([]byte, error) {
 	db.ensureBlobInfo()
 	db.mu.RLock()
 	entry, ok := db.blobEntries[recordKey{db: dbNumber, store: storeID, key: string(key)}]
@@ -532,11 +561,15 @@ func (db *DB) readBlob(dbNumber, storeID uint64, key []byte, index uint64) ([]by
 	if infoOnDisk.Size() > leveldb.MaxDecodedSize {
 		return nil, fmt.Errorf("%w: blob file exceeds %d bytes", ErrBadValue, leveldb.MaxDecodedSize)
 	}
+	if infoOnDisk.Size() < 0 || uint64(infoOnDisk.Size()) != expectedSize {
+		return nil, fmt.Errorf("%w: blob has %d bytes, reference declares %d", ErrBadValue, infoOnDisk.Size(), expectedSize)
+	}
 	readCtx := db.ctx
 	if readCtx == nil {
 		readCtx = context.Background()
 	}
-	data, err := io.ReadAll(io.LimitReader(leveldb.ContextReader{Context: readCtx, Reader: file}, leveldb.MaxDecodedSize+1))
+	limit := min(int64(expectedSize), int64(leveldb.MaxDecodedSize)) + 1
+	data, err := io.ReadAll(io.LimitReader(leveldb.ContextReader{Context: readCtx, Reader: file}, limit))
 	if err != nil {
 		return nil, fmt.Errorf("%w: read blob file: %w", ErrBadValue, err)
 	}

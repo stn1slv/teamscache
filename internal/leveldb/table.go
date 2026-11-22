@@ -1,9 +1,9 @@
 package leveldb
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -57,7 +57,16 @@ func parseTable(ctx context.Context, data []byte, path string) ([]Record, []Dama
 }
 
 func parseTableFiltered(ctx context.Context, data []byte, path string, opts ReadOptions) ([]Record, []Damage, error) {
-	return parseTableAt(ctx, bytes.NewReader(data), int64(len(data)), path, opts)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if len(data) < tableFooterSize {
+		return nil, nil, fmt.Errorf("%w: file shorter than the table footer", ErrCorrupt)
+	}
+	footer := data[len(data)-tableFooterSize:]
+	return parseTableCore(ctx, int64(len(data)), footer, path, opts, func(h blockHandle) ([]byte, bool, error) {
+		return readBlock(data, h)
+	})
 }
 
 func parseTableAt(ctx context.Context, r io.ReaderAt, size int64, path string, opts ReadOptions) ([]Record, []Damage, error) {
@@ -71,10 +80,23 @@ func parseTableAt(ctx context.Context, r io.ReaderAt, size int64, path string, o
 	if err := readExactAt(ctx, r, footer[:], size-tableFooterSize); err != nil {
 		return nil, nil, err
 	}
+	return parseTableCore(ctx, size, footer[:], path, opts, func(h blockHandle) ([]byte, bool, error) {
+		return readBlockAt(ctx, r, size, h)
+	})
+}
+
+func parseTableCore(
+	ctx context.Context,
+	size int64,
+	footer []byte,
+	path string,
+	opts ReadOptions,
+	readBlockFn func(blockHandle) ([]byte, bool, error),
+) ([]Record, []Damage, error) {
 	if binary.LittleEndian.Uint64(footer[40:]) != tableMagic {
 		return nil, nil, fmt.Errorf("%w: bad table magic number", ErrCorrupt)
 	}
-	_, n, err := readBlockHandle(footer[:]) // meta-index handle, not used
+	_, n, err := readBlockHandle(footer) // meta-index handle, not used
 	if err != nil {
 		return nil, nil, err
 	}
@@ -82,10 +104,13 @@ func parseTableAt(ctx context.Context, r io.ReaderAt, size int64, path string, o
 	if err != nil {
 		return nil, nil, err
 	}
-	index, _, err := readBlockAt(ctx, r, size, indexHandle)
+	index, _, err := readBlockFn(indexHandle)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
+		}
+		if !errors.Is(err, ErrCorrupt) {
+			return nil, nil, err
 		}
 		return nil, []Damage{blockDamage(size, path, indexHandle, err)}, nil
 	}
@@ -112,17 +137,22 @@ func parseTableAt(ctx context.Context, r io.ReaderAt, size int64, path string, o
 			prevSep = curSep
 			continue
 		}
-		prevSep = curSep
+		if curSep != nil {
+			prevSep = curSep
+		}
 
 		handle, _, err := readBlockHandle(ie.value)
 		if err != nil {
 			damage = append(damage, blockDamage(size, path, indexHandle, err))
 			continue
 		}
-		block, compressed, err := readBlockAt(ctx, r, size, handle)
+		block, compressed, err := readBlockFn(handle)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()
+			}
+			if !errors.Is(err, ErrCorrupt) {
+				return nil, nil, err
 			}
 			damage = append(damage, blockDamage(size, path, handle, err))
 			continue
@@ -190,8 +220,11 @@ func readExactAt(ctx context.Context, r io.ReaderAt, buf []byte, offset int64) e
 		n, err := r.ReadAt(buf[done:], offset+int64(done))
 		done += n
 		if err != nil {
-			if err == io.EOF && done == len(buf) {
-				return nil
+			if errors.Is(err, io.EOF) {
+				if done == len(buf) {
+					return nil
+				}
+				return io.ErrUnexpectedEOF
 			}
 			return err
 		}
@@ -200,7 +233,27 @@ func readExactAt(ctx context.Context, r io.ReaderAt, buf []byte, offset int64) e
 }
 
 func readBlock(data []byte, h blockHandle) (block []byte, compressed bool, err error) {
-	return readBlockAt(context.Background(), bytes.NewReader(data), int64(len(data)), h)
+	// Subtract instead of adding, so that a corrupt handle cannot overflow.
+	size := uint64(len(data))
+	if h.offset > size || size-h.offset < blockTrailerSize || h.length > size-h.offset-blockTrailerSize {
+		return nil, false, fmt.Errorf("%w: block at offset %d runs past the end of the file", ErrCorrupt, h.offset)
+	}
+	raw := data[h.offset : h.offset+h.length]
+	end := h.offset + h.length
+	if maskedCRC(data[h.offset:end+1]) != binary.LittleEndian.Uint32(data[end+1:end+5]) {
+		return nil, false, fmt.Errorf("%w: checksum mismatch at block offset %d", ErrCorrupt, h.offset)
+	}
+	if data[end] == 0 {
+		return raw, false, nil
+	}
+	if data[end] != 1 {
+		return nil, false, fmt.Errorf("%w: unknown compression type %d", ErrCorrupt, data[end])
+	}
+	decoded, err := DecodeSnappy(raw)
+	if err != nil {
+		return nil, true, fmt.Errorf("%w: snappy block at offset %d: %w", ErrCorrupt, h.offset, err)
+	}
+	return decoded, true, nil
 }
 
 func readBlockAt(ctx context.Context, r io.ReaderAt, fileSize int64, h blockHandle) (block []byte, compressed bool, err error) {

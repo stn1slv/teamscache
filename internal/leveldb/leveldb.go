@@ -150,11 +150,13 @@ type fileResult struct {
 }
 
 // ReadOptions controls which files, table blocks, and records ReadDirOptions
-// reads. Nil callbacks accept everything. KeepBlock and KeepRecord may be
-// called concurrently from multiple worker goroutines and must be safe for
-// concurrent use.
+// reads. Nil callbacks accept everything. KeepFile is called sequentially on
+// the calling goroutine before worker goroutines start. KeepBlock and
+// KeepRecord may be called concurrently from multiple worker goroutines and
+// must be safe for concurrent use.
 type ReadOptions struct {
-	// KeepFile reports whether a data file should be read.
+	// KeepFile reports whether a data file should be read. It runs
+	// sequentially during directory scanning before any file is opened.
 	KeepFile func(number uint64, isLog bool) bool
 	// KeepBlock reports whether a table data block should be decompressed and
 	// decoded. prevUserKey is nil for the first block of a table; otherwise it
@@ -297,6 +299,8 @@ func ReadDirOptions(ctx context.Context, dir string, logger *slog.Logger, opts R
 		return nil, nil, fmt.Errorf("read leveldb directory: %w", err)
 	}
 	var files []dataFile
+	var dupDamage []Damage
+	tableIdx := map[uint64]int{}
 	for _, e := range entries {
 		if !e.Type().IsRegular() {
 			continue
@@ -309,11 +313,29 @@ func ReadDirOptions(ctx context.Context, dir string, logger *slog.Logger, opts R
 		if opts.KeepFile != nil && !opts.KeepFile(number, isLog) {
 			continue
 		}
-		files = append(files, dataFile{
+		df := dataFile{
 			path:   filepath.Join(dir, name),
 			number: number,
 			isLog:  isLog,
-		})
+		}
+		if !isLog {
+			if prev, exists := tableIdx[number]; exists {
+				// LevelDB prefers .ldb over legacy .sst when both share a file number.
+				if strings.HasSuffix(name, ".ldb") && !strings.HasSuffix(files[prev].path, ".ldb") {
+					dupName := filepath.Base(files[prev].path)
+					logger.Warn("duplicate table file number; skipped legacy .sst in favor of .ldb", "file", dupName, "kept", name)
+					dupDamage = append(dupDamage, Damage{File: dupName, Reason: "duplicate table file number; skipped in favor of " + name})
+					files[prev] = df
+				} else {
+					keptName := filepath.Base(files[prev].path)
+					logger.Warn("duplicate table file number; skipped duplicate table", "file", name, "kept", keptName)
+					dupDamage = append(dupDamage, Damage{File: name, Reason: "duplicate table file number; skipped in favor of " + keptName})
+				}
+				continue
+			}
+			tableIdx[number] = len(files)
+		}
+		files = append(files, df)
 	}
 	sort.SliceStable(files, func(i, j int) bool { return files[i].number < files[j].number })
 
@@ -324,7 +346,8 @@ func ReadDirOptions(ctx context.Context, dir string, logger *slog.Logger, opts R
 		return nil, nil, err
 	}
 
-	var totalRecords, totalDamage int
+	var totalRecords int
+	totalDamage := len(dupDamage)
 	for i := range results {
 		if results[i].err != nil {
 			return nil, nil, results[i].err
@@ -334,6 +357,7 @@ func ReadDirOptions(ctx context.Context, dir string, logger *slog.Logger, opts R
 	}
 	records := make([]Record, 0, totalRecords)
 	damage := make([]Damage, 0, totalDamage)
+	damage = append(damage, dupDamage...)
 	for i := range results {
 		for _, w := range results[i].warnings {
 			logger.Warn(w.msg, w.args...)

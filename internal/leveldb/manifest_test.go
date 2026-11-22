@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -133,8 +134,8 @@ func TestReadManifestErrors(t *testing.T) {
 	_, err := ReadManifest(context.Background(), t.TempDir())
 	require.ErrorIs(t, err, fs.ErrNotExist)
 
-	// Path traversal and non-MANIFEST sibling names are rejected.
-	for _, target := range []string{"../escape\n", "LOCK\n", "000001.ldb\n"} {
+	// Path traversal, non-MANIFEST names, and non-digit MANIFEST suffixes are rejected.
+	for _, target := range []string{"../escape\n", "LOCK\n", "000001.ldb\n", "MANIFEST-\n", "MANIFEST-abc\n", "MANIFEST-1\\2\n"} {
 		dir := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte(target), 0o600))
 		_, err = ReadManifest(context.Background(), dir)
@@ -215,4 +216,69 @@ func TestReadDirOptionsFiltersFilesBlocksAndRecords(t *testing.T) {
 	require.Len(t, records, 10)
 	assert.Equal(t, "k-050", string(records[0].UserKey()))
 	assert.Equal(t, "k-059", string(records[9].UserKey()))
+}
+
+type failingReaderAt struct {
+	data      []byte
+	failLimit int64
+	err       error
+}
+
+func (f failingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < f.failLimit {
+		return 0, f.err
+	}
+	return bytes.NewReader(f.data).ReadAt(p, off)
+}
+
+func TestParseTableAtPropagatesIOErrorsAndDeduplicatesLdbOverSst(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	db, err := goleveldb.OpenFile(dir, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Put([]byte("k1"), []byte("v1"), nil))
+	require.NoError(t, db.CompactRange(util.Range{}))
+	require.NoError(t, db.Close())
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var ldbName string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".ldb") {
+			ldbName = e.Name()
+			break
+		}
+	}
+	require.NotEmpty(t, ldbName)
+	tableData, err := os.ReadFile(filepath.Join(dir, ldbName))
+	require.NoError(t, err)
+
+	// Non-ErrCorrupt ReadAt I/O error on index/data block propagates directly instead of becoming Damage.
+	ioErr := errors.New("simulated disk I/O error")
+	_, _, err = parseTableAt(
+		context.Background(),
+		failingReaderAt{data: tableData, failLimit: int64(len(tableData) - tableFooterSize), err: ioErr},
+		int64(len(tableData)),
+		ldbName,
+		ReadOptions{},
+	)
+	require.ErrorIs(t, err, ioErr)
+
+	// Duplicate .sst sharing the same file number as .ldb is skipped in favor of .ldb and reported as damage.
+	sstName := strings.TrimSuffix(ldbName, ".ldb") + ".sst"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, sstName), []byte("stale-sst"), 0o600))
+	recs, damage, err := ReadDir(context.Background(), dir, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	assert.NotEmpty(t, recs)
+	require.Len(t, damage, 1)
+	assert.Equal(t, sstName, damage[0].File)
+	assert.Contains(t, damage[0].Reason, "duplicate table file number")
+
+	// ValidateManifestEntries reports missing active log when LogNumber is nonzero.
+	m := &Manifest{LogNumber: 10}
+	problems := ValidateManifestEntries(m, nil)
+	require.Len(t, problems, 1)
+	assert.Equal(t, "000010.log", problems[0].File)
+	assert.Contains(t, problems[0].Reason, "missing active log")
+	assert.Empty(t, ValidateManifestEntries(m, []FileEntry{{Name: "000011.log", Number: 11, IsLog: true}}))
 }

@@ -53,8 +53,10 @@ type DiscoveredCache struct {
 	Modified time.Time `json:"modified"`
 }
 
-// DefaultCacheGlobs returns the places where the new Teams client keeps its
-// IndexedDB LevelDB on this operating system.
+// DefaultCacheGlobs returns the glob patterns where the new Teams client keeps
+// IndexedDB LevelDB folders on this operating system. Callers that want only
+// Microsoft Teams origins should use DiscoverCaches instead of matching these
+// patterns directly.
 func DefaultCacheGlobs() []string {
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {

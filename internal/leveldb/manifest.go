@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -71,13 +73,136 @@ func (m *Manifest) IsActiveLog(number uint64) bool {
 	return number >= m.LogNumber || (m.PrevLogNumber != 0 && number == m.PrevLogNumber)
 }
 
-// ValidateManifestName checks that name is a safe MANIFEST filename within a
-// LevelDB directory.
+// ValidateManifestName checks that name is a safe MANIFEST-<digits> filename
+// within a LevelDB directory.
 func ValidateManifestName(name string) error {
-	if name == "" || name == "." || name == ".." || filepath.Base(name) != name || !strings.HasPrefix(name, "MANIFEST-") {
+	suffix, ok := strings.CutPrefix(name, "MANIFEST-")
+	if !ok || suffix == "" {
 		return fmt.Errorf("%w: invalid CURRENT target %q", ErrCorrupt, name)
 	}
+	for i := range len(suffix) {
+		if suffix[i] < '0' || suffix[i] > '9' {
+			return fmt.Errorf("%w: invalid CURRENT target %q", ErrCorrupt, name)
+		}
+	}
 	return nil
+}
+
+// FileEntry describes one regular LevelDB data file present in a directory.
+type FileEntry struct {
+	Name   string
+	Number uint64
+	IsLog  bool
+	Size   int64
+}
+
+// ValidateManifestEntries verifies that every active table listed in manifest
+// exists with its expected size (preferring .ldb over .sst if both share a
+// file number), that any nonzero PrevLogNumber log exists, and that at least
+// one active log (>= LogNumber) exists when LogNumber is nonzero.
+func ValidateManifestEntries(manifest *Manifest, entries []FileEntry) []Damage {
+	if manifest == nil || (len(manifest.Tables) == 0 && manifest.PrevLogNumber == 0 && manifest.LogNumber == 0) {
+		return nil
+	}
+	presentTables := make(map[uint64]FileEntry, len(entries))
+	presentLogs := make(map[uint64]bool, len(entries))
+	for _, e := range entries {
+		if e.IsLog {
+			presentLogs[e.Number] = true
+			continue
+		}
+		if prev, exists := presentTables[e.Number]; exists && strings.HasSuffix(prev.Name, ".ldb") {
+			continue
+		}
+		presentTables[e.Number] = e
+	}
+
+	tableNums := make([]uint64, 0, len(manifest.Tables))
+	for num := range manifest.Tables {
+		tableNums = append(tableNums, num)
+	}
+	slices.Sort(tableNums)
+
+	var problems []Damage
+	for _, num := range tableNums {
+		ti := manifest.Tables[num]
+		entry, ok := presentTables[num]
+		if !ok {
+			problems = append(problems, Damage{
+				File:   fmt.Sprintf("%06d.ldb", num),
+				Reason: "manifest references missing table file",
+			})
+			continue
+		}
+		if ti.Size > 0 && (entry.Size < 0 || uint64(entry.Size) != ti.Size) {
+			problems = append(problems, Damage{
+				File:   entry.Name,
+				Reason: fmt.Sprintf("table file size %d does not match manifest size %d", entry.Size, ti.Size),
+			})
+		}
+	}
+	if manifest.PrevLogNumber != 0 && !presentLogs[manifest.PrevLogNumber] {
+		problems = append(problems, Damage{
+			File:   fmt.Sprintf("%06d.log", manifest.PrevLogNumber),
+			Reason: "manifest references missing previous log file",
+		})
+	}
+	if manifest.LogNumber != 0 {
+		hasActiveLog := false
+		for num := range presentLogs {
+			if num >= manifest.LogNumber {
+				hasActiveLog = true
+				break
+			}
+		}
+		if !hasActiveLog {
+			problems = append(problems, Damage{
+				File:   fmt.Sprintf("%06d.log", manifest.LogNumber),
+				Reason: "manifest references missing active log file",
+			})
+		}
+	}
+	return problems
+}
+
+// ValidateManifestDir scans dir and validates its regular data files against
+// manifest using ValidateManifestEntries.
+func ValidateManifestDir(dir string, manifest *Manifest) ([]Damage, error) {
+	if manifest == nil || (len(manifest.Tables) == 0 && manifest.PrevLogNumber == 0 && manifest.LogNumber == 0) {
+		return nil, nil
+	}
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read leveldb directory: %w", err)
+	}
+	entries := make([]FileEntry, 0, len(dirEntries))
+	for _, e := range dirEntries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		num, isLog, ok := ParseFileNumber(e.Name())
+		if !ok {
+			continue
+		}
+		var size int64
+		if !isLog {
+			info, infoErr := e.Info()
+			if errors.Is(infoErr, fs.ErrNotExist) {
+				continue
+			}
+			if infoErr != nil {
+				return nil, fmt.Errorf("stat leveldb table %s: %w", e.Name(), infoErr)
+			}
+			size = info.Size()
+		}
+		entries = append(entries, FileEntry{
+			Name:   e.Name(),
+			Number: num,
+			IsLog:  isLog,
+			Size:   size,
+		})
+	}
+	return ValidateManifestEntries(manifest, entries), nil
 }
 
 // ReadManifest reads CURRENT and replays the referenced MANIFEST file in dir.

@@ -13,9 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/golang/snappy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -304,7 +306,7 @@ func TestReadBlobRejectsOversizedFile(t *testing.T) {
 		{db: 1, store: 1, key: string(key)}: {infos: []blobInfo{{kind: externalObjectBlob, number: 1}}},
 	}}
 
-	_, err = db.readBlob(1, 1, key, 0)
+	_, err = db.readBlob(1, 1, key, 0, leveldb.MaxDecodedSize+1)
 
 	require.ErrorIs(t, err, ErrBadValue)
 	assert.Contains(t, err.Error(), "exceeds")
@@ -474,13 +476,17 @@ func TestParseBlobEntriesHandlesFileSystemHandleAndErrors(t *testing.T) {
 		{Key: append(makePrefix(1, 1, indexBlobEntry), key...), Value: raw, Seq: 1, State: leveldb.Live, FileType: leveldb.Log},
 	}}
 
-	_, err = db.readBlob(1, 1, key, 0)
+	_, err = db.readBlob(1, 1, key, 0, 9)
 	require.ErrorIs(t, err, ErrBadValue)
 	assert.Contains(t, err.Error(), "unsupported type 2")
 
-	got, err := db.readBlob(1, 1, key, 1)
+	got, err := db.readBlob(1, 1, key, 1, uint64(len("blob-data")))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("blob-data"), got)
+
+	_, err = db.readBlob(1, 1, key, 1, 999)
+	require.ErrorIs(t, err, ErrBadValue)
+	assert.Contains(t, err.Error(), "reference declares 999")
 }
 
 func TestBlinkTrailerBounds(t *testing.T) {
@@ -680,6 +686,7 @@ func testWriteIDBManifest(t *testing.T, dir string, tables []struct {
 	binary.LittleEndian.PutUint32(frag, testMaskedCRC(frag[6:]))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "CURRENT"), []byte("MANIFEST-000001\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "MANIFEST-000001"), frag, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "000010.log"), nil, 0o600))
 }
 
 func testIDBString(s string) []byte {
@@ -856,6 +863,7 @@ func TestOpenLiveChecksPrevLogNumberAndTableSize(t *testing.T) {
 	binary.LittleEndian.PutUint32(frag, testMaskedCRC(frag[6:]))
 	require.NoError(t, os.WriteFile(filepath.Join(dirPrevLog, "CURRENT"), []byte("MANIFEST-000001\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dirPrevLog, "MANIFEST-000001"), frag, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dirPrevLog, "000010.log"), nil, 0o600))
 
 	dbPrev, err := OpenLive(context.Background(), dirPrevLog, "", slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
@@ -863,6 +871,26 @@ func TestOpenLiveChecksPrevLogNumberAndTableSize(t *testing.T) {
 	require.Len(t, dbPrev.Damage(), 1)
 	assert.Equal(t, "000008.log", dbPrev.Damage()[0].File)
 	assert.Contains(t, dbPrev.Damage()[0].Reason, "previous log")
+
+	// Missing active WAL (>= LogNumber) triggers fallback and reports the missing log.
+	dirActiveLog := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dirActiveLog, "000001.ldb"), tableBytes, 0o600))
+	testWriteIDBManifest(t, dirActiveLog, []struct {
+		num               uint64
+		size              uint64
+		smallest, largest []byte
+	}{{
+		num: 1, size: uint64(len(tableBytes)),
+		smallest: testInternalKey(dbNameKey, 1, true),
+		largest:  testInternalKey(dbNameKey, 1, true),
+	}})
+	require.NoError(t, os.Remove(filepath.Join(dirActiveLog, "000010.log")))
+	dbMissingLog, err := OpenLive(context.Background(), dirActiveLog, "", slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	assert.False(t, dbMissingLog.lazyStores)
+	require.Len(t, dbMissingLog.Damage(), 1)
+	assert.Equal(t, "000010.log", dbMissingLog.Damage()[0].File)
+	assert.Contains(t, dbMissingLog.Damage()[0].Reason, "active log")
 }
 
 func TestLoadStoresDetectsDisappearedTableAndContextCancellation(t *testing.T) {
@@ -907,7 +935,26 @@ func TestLoadStoresDetectsDisappearedTableAndContextCancellation(t *testing.T) {
 	require.ErrorIs(t, dbCanceled.LoadStores(context.Background(), nil), context.Canceled)
 	assert.Empty(t, dbCanceled.loadedStores)
 
-	// Remove data table after OpenLive; lazy read reports damage and skips marking loaded.
+	// Nil contexts in mergeContext and LoadStores do not panic.
+	nonLazy := &DB{}
+	require.NoError(t, nonLazy.LoadStores(nil, nil)) //nolint:staticcheck // explicitly testing nil-context safety
+
+	// Waiting on load lock respects cancellation immediately.
+	dbLock, err := OpenLive(context.Background(), dir, "", slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	require.NoError(t, dbLock.acquireLoadLock(context.Background()))
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	cancelWait()
+	require.ErrorIs(t, dbLock.LoadStores(waitCtx, nil), context.Canceled)
+	dbLock.releaseLoadLock()
+
+	// Reentrant accept callback calling DB methods does not deadlock.
+	require.NoError(t, dbLock.LoadStores(context.Background(), func(dbNumber, storeID uint64) bool {
+		_ = dbLock.Damage()
+		return dbNumber == 1 && storeID == 1
+	}))
+
+	// Remove data table after OpenLive; lazy read reports damage and caches the store failure.
 	db, err := OpenLive(context.Background(), dir, "", slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 	require.NoError(t, os.Remove(filepath.Join(dir, "000002.ldb")))
@@ -916,14 +963,131 @@ func TestLoadStoresDetectsDisappearedTableAndContextCancellation(t *testing.T) {
 	for range db.CurrentRecords(1, 1, func(err error) { onBadErrs = append(onBadErrs, err) }) {
 		t.Fatal("expected no records when table disappeared")
 	}
-	assert.NotEmpty(t, onBadErrs)
+	assert.Len(t, onBadErrs, 1)
 	assert.False(t, db.loadedStores[storeAddr{db: 1, store: 1}])
+	// Second read on the failed store does not retry or call onBad again.
+	for range db.CurrentRecords(1, 1, func(err error) { onBadErrs = append(onBadErrs, err) }) {
+		t.Fatal("expected no records on cached store failure")
+	}
+	assert.Len(t, onBadErrs, 1)
 	damage := db.Damage()
 	files := make([]string, 0, len(damage))
 	for _, d := range damage {
 		files = append(files, d.File)
 	}
 	assert.Contains(t, files, "000002.ldb")
+}
+
+func TestOpenLiveIDBCmp1ConcurrentLazyLoadAndEstimatedBytes(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, blobDir := filepath.Join(root, "lazy.leveldb"), filepath.Join(root, "lazy.blob")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+
+	dbNameKey := append([]byte{0, 0, 0, 0, databaseNamePrefixByte}, testIDBString("https_example.test_0@1")...)
+	dbNameKey = append(dbNameKey, testIDBString("db1")...)
+	maxStoreKey := append(makePrefix(1, 0, 0), dbMetaMaxObjectStoreID)
+	store1NameKey := append(makePrefix(1, 0, 0), objectStoreMetaByte, 1, objectStoreMetaName)
+	store2NameKey := append(makePrefix(1, 0, 0), objectStoreMetaByte, 2, objectStoreMetaName)
+
+	const count = parallelDecodeThreshold + 4
+	store1Entries := make([][2][]byte, 0, 2*count)
+	store2Entries := make([][2][]byte, 0, count)
+	seq := uint64(10)
+	for i := range count {
+		k := append([]byte{1}, testIDBString(fmt.Sprintf("k%03d", i))...)
+		blobVal := idbtest.Envelope(fmt.Sprintf("lazy-blob-%d", i))
+		blobNum := uint64(i + 1)
+		bp := blobPath(blobDir, 1, blobNum)
+		require.NoError(t, os.MkdirAll(filepath.Dir(bp), 0o700))
+		require.NoError(t, os.WriteFile(bp, blobVal, 0o600))
+		blobRef := append(binary.AppendUvarint([]byte{1, 0xff, blinkWrappedPseudoVer, blinkReplaceWithBlob}, uint64(len(blobVal))), 0)
+		blobMeta := binary.AppendUvarint(binary.AppendUvarint([]byte{0}, blobNum), 0)
+		blobMeta = binary.AppendUvarint(blobMeta, uint64(len(blobVal)))
+		store1Entries = append(store1Entries, [2][]byte{testInternalKey(append(makePrefix(1, 1, 1), k...), seq, true), blobRef})
+		seq++
+		store1Entries = append(store1Entries, [2][]byte{testInternalKey(append(makePrefix(1, 1, 3), k...), seq, true), blobMeta})
+		seq++
+
+		store2Entries = append(store2Entries, [2][]byte{
+			testInternalKey(append(makePrefix(1, 2, 1), k...), seq, true),
+			append([]byte{1}, idbtest.Envelope(fmt.Sprintf("lazy-inline-%d", i))...),
+		})
+		seq++
+	}
+	// Sort entries in idb_cmp1 order within each block by prefix then key.
+	s1Data := make([][2][]byte, 0, count)
+	s1Blobs := make([][2][]byte, 0, count)
+	for i := 0; i < len(store1Entries); i += 2 {
+		s1Data = append(s1Data, store1Entries[i])
+		s1Blobs = append(s1Blobs, store1Entries[i+1])
+	}
+	tableBytes := testBuildSSTable([]struct {
+		entries [][2][]byte
+		corrupt bool
+	}{
+		{entries: [][2][]byte{
+			{testInternalKey(dbNameKey, 1, true), []byte{1}},
+			{testInternalKey(maxStoreKey, 2, true), []byte{2}},
+			{testInternalKey(store1NameKey, 3, true), testUTF16BE("s1")},
+			{testInternalKey(store2NameKey, 4, true), testUTF16BE("s2")},
+		}},
+		{entries: s1Data},
+		{entries: s1Blobs},
+		{entries: store2Entries},
+	})
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "000001.ldb"), tableBytes, 0o600))
+	testWriteIDBManifest(t, dir, []struct {
+		num               uint64
+		size              uint64
+		smallest, largest []byte
+	}{{
+		num: 1, size: uint64(len(tableBytes)),
+		smallest: testInternalKey(dbNameKey, 1, true),
+		largest:  store2Entries[len(store2Entries)-1][0],
+	}})
+
+	db, err := OpenLive(context.Background(), dir, blobDir, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	require.True(t, db.lazyStores, "idb_cmp1 fixture exercises true lazy loading")
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	var got1, got2 []any
+	var blobs []string
+	go func() {
+		defer wg.Done()
+		for rec := range db.CurrentRecords(1, 1, nil) {
+			if rec.Err == nil {
+				got1 = append(got1, rec.Value)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for rec := range db.CurrentRecords(1, 2, nil) {
+			if rec.Err == nil {
+				got2 = append(got2, rec.Value)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		blobs = db.BlobFilesFor(func(dbNumber, _ uint64) bool {
+			_ = db.Damage()
+			return dbNumber == 1
+		})
+	}()
+	wg.Wait()
+
+	assert.Len(t, got1, count)
+	assert.Len(t, got2, count)
+	assert.Len(t, blobs, count)
+
+	// Verify Snappy expansion is accounted for in estimatedRecordBytes.
+	largePlain := idbtest.Envelope(strings.Repeat("a", 128<<10))
+	compressed := append([]byte{1, blinkVersionTag, blinkWrappedPseudoVer, blinkCompressedSnappy}, snappy.Encode(nil, largePlain)...)
+	assert.Greater(t, estimatedRecordBytes(compressed), len(largePlain), "Snappy decoded length is included in byte budget")
 }
 
 func TestCurrentRecordsParallelBlobsNilOnBadAndConcurrentAccess(t *testing.T) {
